@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: jarvis-ai-server
+    env: python
+    region: singapore
+    plan: free
+    buildCommand: pip install -r server/requirements.txt
+    startCommand: cd server && uvicorn gemini-code-1795329199931:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: GROQ_API_KEY
+        sync: false
