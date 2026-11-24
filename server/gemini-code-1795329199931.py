@@ -401,7 +401,7 @@ async def dashboard():
         </div>
         <div id="testReply" class="reply-box" style="font-size:16px;line-height:1.6">Answer yahan dikhega...</div>
         <div style="margin-top:8px;display:flex;align-items:center;gap:10px">
-          <button id="speakBtn" onclick="speakLast()" style="display:none;background:#7c3aed">🔊 Dobara Suno</button>
+          <button id="speakBtn" onclick="toggleSpeak()" style="display:none;background:#7c3aed">🔊 Dobara Suno</button>
           <label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-size:14px">
             <input type="checkbox" id="autoSpeak" checked style="width:auto;margin:0"> Auto Voice
           </label>
@@ -524,20 +524,63 @@ async def dashboard():
             window._lastReply = res.reply;
             document.getElementById('speakBtn').style.display = 'inline-block';
             if (document.getElementById('autoSpeak').checked) {
-              speakText(res.reply);
+              speakText(res.reply);   // stopAudio() internally call hoti hai
             }
           }
           inp.value = '';
           load();
         }
 
+        // ── Audio player: proper stop/start with no ghost playback ──
         let currentAudio = null;
-        function speakText(text) {
-          if (currentAudio) { currentAudio.pause(); currentAudio = null; }
-          const url = '/api/speak?text=' + encodeURIComponent(text);
-          currentAudio = new Audio(url);
-          currentAudio.play().catch(e => console.log('Audio play failed:', e));
+        let audioStopped = false;   // Flag: user ne manually stop kiya
+
+        function stopAudio() {
+          audioStopped = true;
+          if (currentAudio) {
+            currentAudio.onended = null;   // Remove any callbacks
+            currentAudio.onerror = null;
+            currentAudio.pause();
+            currentAudio.src = '';         // Browser download cancel karo
+            currentAudio.load();           // Reset media element
+            currentAudio = null;
+          }
+          const btn = document.getElementById('speakBtn');
+          if (btn) { btn.textContent = '🔊 Dobara Suno'; btn.style.background = '#7c3aed'; }
         }
+
+        function speakText(text) {
+          stopAudio();              // Pehle purana band karo
+          audioStopped = false;    // Reset flag for new play
+          const url = '/api/speak?text=' + encodeURIComponent(text);
+          currentAudio = new Audio();
+          currentAudio.preload = 'auto';
+
+          currentAudio.oncanplay = function() {
+            if (audioStopped) return;   // User ne stop kar diya tha
+            this.play().catch(() => {});
+            const btn = document.getElementById('speakBtn');
+            if (btn) { btn.textContent = '⏹ Stop'; btn.style.background = '#ef4444'; }
+          };
+          currentAudio.onended = function() {
+            const btn = document.getElementById('speakBtn');
+            if (btn) { btn.textContent = '🔊 Dobara Suno'; btn.style.background = '#7c3aed'; }
+            currentAudio = null;
+          };
+          currentAudio.onerror = function() {
+            currentAudio = null;
+          };
+          currentAudio.src = url;  // Src set karo — load shuru hoga
+        }
+
+        function toggleSpeak() {
+          if (currentAudio && !currentAudio.paused) {
+            stopAudio();   // Playing hai → Stop karo
+          } else {
+            if (window._lastReply) speakText(window._lastReply);  // Stopped hai → Play karo
+          }
+        }
+
         function speakLast() {
           if (window._lastReply) speakText(window._lastReply);
         }
