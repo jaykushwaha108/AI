@@ -370,240 +370,359 @@ async def api_speak(text: str):
 
 @app.get("/", response_class=HTMLResponse)
 async def dashboard():
-    return """
-    <!DOCTYPE html>
-    <html>
-    <head>
-      <title>Custom AI Console</title>
-      <meta name="viewport" content="width=device-width, initial-scale=1">
-      <style>
-        body { font-family: system-ui, sans-serif; background: #0f172a; color: #e2e8f0; max-width: 800px; margin: auto; padding: 20px; }
-        .card { background: #1e293b; padding: 18px; border-radius: 12px; margin-bottom: 16px; }
-        input, textarea, select { width: 100%; padding: 10px; margin: 6px 0 12px; background: #0f172a; color: #fff; border: 1px solid #334155; border-radius: 8px; box-sizing: border-box; }
-        button { background: #3b82f6; color: #fff; border: none; padding: 10px 16px; border-radius: 8px; cursor: pointer; margin-right: 8px; }
-        button.danger { background: #ef4444; }
-        button.green { background: #10b981; }
-        .badge { padding: 4px 10px; border-radius: 999px; font-size: 13px; font-weight: bold; }
-        .on { background: #065f46; color: #34d399; }
-        .off { background: #7f1d1d; color: #f87171; }
-        .msg { padding: 8px 12px; margin: 6px 0; border-radius: 8px; background: #0f172a; }
-        .reply-box { margin-top: 12px; padding: 10px; border-radius: 8px; background: #0f172a; color: #38bdf8; min-height: 20px; }
-      </style>
-    </head>
-    <body>
-      <h2>My AI Assistant Console <span id="status" class="badge off">Offline</span></h2>
+    return """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Jarvis AI — Console</title>
+<style>
+  :root {
+    --bg:      #080808;
+    --surface: #111111;
+    --panel:   #181818;
+    --border:  #242424;
+    --red:     #D41514;
+    --silver:  #CDCBCA;
+    --dim:     #555555;
+    --text:    #e8e8e8;
+    --green:   #22c55e;
+    --blue:    #38bdf8;
+    --yellow:  #fbbf24;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html,body{height:100%;font-family:'Segoe UI',system-ui,sans-serif;background:var(--bg);color:var(--text)}
+  .shell{display:flex;height:100vh;overflow:hidden}
+  .sidebar{width:220px;background:var(--surface);border-right:1px solid var(--border);display:flex;flex-direction:column;flex-shrink:0}
+  .main{flex:1;display:flex;flex-direction:column;overflow:hidden}
+  .topbar{height:54px;background:var(--surface);border-bottom:1px solid var(--border);display:flex;align-items:center;padding:0 24px;gap:12px;flex-shrink:0}
+  .content{flex:1;overflow-y:auto;padding:24px}
+  .page{display:none}
+  .page.active{display:block}
+  .logo{padding:20px 18px 14px;border-bottom:1px solid var(--border)}
+  .logo-title{font-size:18px;font-weight:700;color:var(--red);letter-spacing:2px}
+  .logo-sub{font-size:10px;color:var(--dim);letter-spacing:3px;margin-top:2px;text-transform:uppercase}
+  .nav{flex:1;padding:10px 0}
+  .nav-item{display:flex;align-items:center;gap:10px;padding:11px 18px;cursor:pointer;font-size:13px;color:var(--dim);transition:all .15s;border-left:3px solid transparent}
+  .nav-item:hover{color:var(--text);background:var(--panel)}
+  .nav-item.active{color:var(--red);border-left-color:var(--red);background:var(--panel);font-weight:600}
+  .nav-icon{font-size:16px;width:20px;text-align:center}
+  .sidebar-footer{padding:14px 18px;border-top:1px solid var(--border)}
+  .topbar-title{font-size:15px;font-weight:600;flex:1}
+  .badge{display:inline-flex;align-items:center;gap:5px;padding:4px 10px;border-radius:999px;font-size:11px;font-weight:700;letter-spacing:.5px}
+  .badge::before{content:'';width:7px;height:7px;border-radius:50%;background:currentColor}
+  .badge.online{background:#052e16;color:var(--green)}
+  .badge.offline{background:#1c0a0a;color:var(--red)}
+  .card{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:20px;margin-bottom:18px}
+  .card-title{font-size:12px;font-weight:700;color:var(--dim);text-transform:uppercase;letter-spacing:1.5px;margin-bottom:14px}
+  .chat-messages{min-height:260px;max-height:420px;overflow-y:auto;background:var(--surface);border-radius:10px;padding:14px;margin-bottom:14px;border:1px solid var(--border)}
+  .msg-row{margin-bottom:14px}
+  .msg-role{font-size:10px;font-weight:700;letter-spacing:1px;text-transform:uppercase;margin-bottom:4px}
+  .msg-role.user{color:var(--blue)}
+  .msg-role.assistant{color:var(--red)}
+  .msg-bubble{background:var(--panel);border-radius:8px;padding:10px 14px;font-size:14px;line-height:1.6;border:1px solid var(--border)}
+  .msg-bubble.typing{color:var(--dim);font-style:italic}
+  .input-row{display:flex;gap:10px;align-items:center}
+  .input-row input{flex:1;background:var(--surface);border:1px solid var(--border);color:var(--text);border-radius:8px;padding:11px 14px;font-size:14px;outline:none;transition:border .15s}
+  .input-row input:focus{border-color:var(--red)}
+  .input-row input::placeholder{color:var(--dim)}
+  .btn{display:inline-flex;align-items:center;gap:6px;padding:10px 18px;border:none;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer;transition:opacity .15s;letter-spacing:.3px}
+  .btn:hover{opacity:.85}
+  .btn-primary{background:var(--red);color:#fff}
+  .btn-ghost{background:var(--border);color:var(--silver)}
+  .btn-green{background:#052e16;color:var(--green);border:1px solid var(--green)}
+  .btn-red{background:#1c0a0a;color:var(--red);border:1px solid var(--red)}
+  .btn-purple{background:#2d1b69;color:#a78bfa}
+  .btn-sm{padding:6px 12px;font-size:12px}
+  .form-group{margin-bottom:16px}
+  .form-label{font-size:11px;color:var(--dim);font-weight:600;letter-spacing:1px;text-transform:uppercase;display:block;margin-bottom:6px}
+  .form-input,.form-select,.form-textarea{width:100%;background:var(--surface);border:1px solid var(--border);color:var(--text);border-radius:8px;padding:10px 14px;font-size:13px;outline:none;transition:border .15s}
+  .form-input:focus,.form-select:focus,.form-textarea:focus{border-color:var(--red)}
+  .form-textarea{resize:vertical;min-height:90px}
+  .form-select option{background:var(--surface)}
+  .btn-row{display:flex;gap:10px;flex-wrap:wrap;margin-top:4px}
+  .stat-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+  .stat-card{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:16px}
+  .stat-label{font-size:10px;color:var(--dim);text-transform:uppercase;letter-spacing:1px}
+  .stat-val{font-size:32px;font-weight:800;margin:6px 0 2px}
+  .stat-sub{font-size:11px;color:var(--dim)}
+  .bar-track{height:5px;background:var(--border);border-radius:3px;margin-top:10px;overflow:hidden}
+  .bar-fill{height:100%;border-radius:3px;transition:width .6s,background .3s}
+  .hist-item{padding:10px 14px;background:var(--surface);border-radius:8px;margin-bottom:8px;border:1px solid var(--border);font-size:13px;line-height:1.5}
+  .hist-role{font-size:10px;font-weight:700;letter-spacing:1px;text-transform:uppercase;margin-bottom:3px}
+  .hist-role.user{color:var(--blue)}
+  .hist-role.assistant{color:var(--red)}
+  .hist-time{font-size:10px;color:var(--dim);float:right}
+  .iot-row{display:flex;align-items:center;justify-content:space-between;background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:14px 18px;margin-bottom:12px}
+  .voice-bar{display:flex;align-items:center;gap:10px;padding:8px 0}
+  ::-webkit-scrollbar{width:5px}
+  ::-webkit-scrollbar-track{background:transparent}
+  ::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px}
+  @media(max-width:600px){
+    .sidebar{width:56px}
+    .nav-label,.logo-sub,.logo-title,.sidebar-footer{display:none}
+    .nav-item{justify-content:center;padding:12px}
+    .stat-grid{grid-template-columns:1fr}
+  }
+</style>
+</head>
+<body>
+<div class="shell">
+  <aside class="sidebar">
+    <div class="logo">
+      <div class="logo-title">JARVIS</div>
+      <div class="logo-sub">AI Console v2</div>
+    </div>
+    <nav class="nav">
+      <div class="nav-item active" onclick="showPage('chat',this)"><span class="nav-icon">💬</span><span class="nav-label">Chat</span></div>
+      <div class="nav-item" onclick="showPage('settings',this)"><span class="nav-icon">⚙️</span><span class="nav-label">Settings</span></div>
+      <div class="nav-item" onclick="showPage('history',this)"><span class="nav-icon">📜</span><span class="nav-label">History</span></div>
+      <div class="nav-item" onclick="showPage('iot',this)"><span class="nav-icon">💡</span><span class="nav-label">IoT / LED</span></div>
+      <div class="nav-item" onclick="showPage('quota',this)"><span class="nav-icon">📊</span><span class="nav-label">API Quota</span></div>
+    </nav>
+    <div class="sidebar-footer" style="font-size:11px;color:var(--dim)">ESP32 &nbsp;<span id="espDot">●</span></div>
+  </aside>
+  <div class="main">
+    <div class="topbar">
+      <span class="topbar-title" id="pageTitle">Chat</span>
+      <span id="espBadge" class="badge offline">ESP32 Offline</span>
+    </div>
+    <div class="content">
 
-      <div class="card">
-        <h3>🤖 Chat with Jarvis</h3>
-        <div style="display:flex;gap:8px;align-items:center">
-          <input id="testInput" placeholder="Kuch bhi pucho... (Enter dabao ya Send karo)" onkeydown="if(event.key==='Enter') sendTest()" style="margin:0">
-          <button class="green" onclick="sendTest()" style="white-space:nowrap">Send 🚀</button>
-        </div>
-        <div id="testReply" class="reply-box" style="font-size:16px;line-height:1.6">Answer yahan dikhega...</div>
-        <div style="margin-top:8px;display:flex;align-items:center;gap:10px">
-          <button id="speakBtn" onclick="toggleSpeak()" style="display:none;background:#7c3aed">🔊 Dobara Suno</button>
-          <label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-size:14px">
-            <input type="checkbox" id="autoSpeak" checked style="width:auto;margin:0"> Auto Voice
-          </label>
-        </div>
-      </div>
-
-      <div class="card">
-        <h3>Role & Voice Settings</h3>
-        <label>Assistant Name</label><input id="name">
-        <label>System Prompt / Personality</label><textarea id="prompt" rows="3"></textarea>
-        <label>Voice (Free Edge-TTS)</label>
-        <select id="voice">
-          <option value="hi-IN-SwaraNeural">Hindi Female (Swara)</option>
-          <option value="hi-IN-MadhurNeural">Hindi Male (Madhur)</option>
-          <option value="en-IN-NeerjaNeural">Indian English Female (Neerja)</option>
-          <option value="en-IN-PrabhatNeural">Indian English Male (Prabhat)</option>
-        </select>
-        <button onclick="save()">Save Settings</button>
-        <button class="green" onclick="led('on')">LED ON</button>
-        <button class="danger" onclick="led('off')">LED OFF</button>
-      </div>
-
-      <div class="card">
-        <h3>Conversation Memory <button class="danger" style="float:right;padding:4px 10px" onclick="clearMem()">Clear</button></h3>
-        <div id="logs"></div>
-      </div>
-
-      <div class="card" id="quotaCard">
-        <h3>📊 Groq API Quota <small style="font-size:12px;color:#64748b">(last request ke baad update hota hai)</small></h3>
-        <div id="quotaBox" style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:10px">
-          <div style="background:#0f172a;border-radius:8px;padding:12px">
-            <div style="font-size:11px;color:#64748b;text-transform:uppercase;letter-spacing:1px">Requests Remaining</div>
-            <div id="reqRem" style="font-size:28px;font-weight:bold;color:#34d399">—</div>
-            <div id="reqLim" style="font-size:12px;color:#64748b">of — | Reset: —</div>
-            <div style="margin-top:6px;background:#1e293b;border-radius:4px;height:6px;overflow:hidden">
-              <div id="reqBar" style="height:100%;background:#34d399;width:0%;transition:width 0.5s"></div>
+      <!-- CHAT -->
+      <div class="page active" id="page-chat">
+        <div class="card">
+          <div class="card-title">AI Response</div>
+          <div class="chat-messages" id="chatBox">
+            <div class="msg-row">
+              <div class="msg-role assistant">Jarvis</div>
+              <div class="msg-bubble typing">Yahan Jarvis ka jawab aayega...</div>
             </div>
           </div>
-          <div style="background:#0f172a;border-radius:8px;padding:12px">
-            <div style="font-size:11px;color:#64748b;text-transform:uppercase;letter-spacing:1px">Tokens Remaining</div>
-            <div id="tokRem" style="font-size:28px;font-weight:bold;color:#38bdf8">—</div>
-            <div id="tokLim" style="font-size:12px;color:#64748b">of — | Reset: —</div>
-            <div style="margin-top:6px;background:#1e293b;border-radius:4px;height:6px;overflow:hidden">
-              <div id="tokBar" style="height:100%;background:#38bdf8;width:0%;transition:width 0.5s"></div>
+          <div class="voice-bar">
+            <button class="btn btn-purple btn-sm" id="speakBtn" onclick="toggleSpeak()" style="display:none">🔊 Play</button>
+            <label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-size:12px;color:var(--dim)">
+              <input type="checkbox" id="autoSpeak" checked style="accent-color:var(--red)"> Auto Voice
+            </label>
+          </div>
+          <div class="input-row">
+            <input id="testInput" placeholder="Jarvis se kuch bhi pucho..." onkeydown="if(event.key==='Enter') sendTest()">
+            <button class="btn btn-primary" onclick="sendTest()">Send ➤</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- SETTINGS -->
+      <div class="page" id="page-settings">
+        <div class="card">
+          <div class="card-title">Assistant Identity</div>
+          <div class="form-group">
+            <label class="form-label">Assistant Name</label>
+            <input class="form-input" id="name" placeholder="Jarvis">
+          </div>
+          <div class="form-group">
+            <label class="form-label">Personality / System Prompt</label>
+            <textarea class="form-textarea" id="prompt" rows="5"></textarea>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-title">Voice Engine</div>
+          <div class="form-group">
+            <label class="form-label">TTS Voice (Edge-TTS)</label>
+            <select class="form-select" id="voice">
+              <option value="hi-IN-SwaraNeural">🇮🇳 Hindi Female — Swara</option>
+              <option value="hi-IN-MadhurNeural">🇮🇳 Hindi Male — Madhur</option>
+              <option value="en-IN-NeerjaNeural">🇮🇳 English Female — Neerja</option>
+              <option value="en-IN-PrabhatNeural">🇮🇳 English Male — Prabhat</option>
+            </select>
+          </div>
+          <div class="btn-row">
+            <button class="btn btn-primary" onclick="saveSettings()">💾 Save Changes</button>
+          </div>
+          <div id="saveMsg" style="margin-top:10px;font-size:12px;color:var(--green);display:none">✓ Settings saved!</div>
+        </div>
+      </div>
+
+      <!-- HISTORY -->
+      <div class="page" id="page-history">
+        <div class="card">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px">
+            <span class="card-title" style="margin-bottom:0">Conversation Memory</span>
+            <button class="btn btn-red btn-sm" onclick="clearMem()">🗑 Clear All</button>
+          </div>
+          <div id="historyList"><div style="color:var(--dim);font-size:13px">No history yet.</div></div>
+        </div>
+      </div>
+
+      <!-- IOT -->
+      <div class="page" id="page-iot">
+        <div class="card">
+          <div class="card-title">IoT Device Control</div>
+          <div class="iot-row">
+            <div>
+              <div style="font-size:14px;font-weight:600">💡 Room LED / Light</div>
+              <div style="font-size:11px;color:var(--dim);margin-top:2px">ESP32 GPIO controlled</div>
+            </div>
+            <div class="btn-row">
+              <button class="btn btn-green btn-sm" onclick="ledCtrl('on')">ON</button>
+              <button class="btn btn-red btn-sm" onclick="ledCtrl('off')">OFF</button>
             </div>
           </div>
         </div>
-        <div id="quotaNote" style="margin-top:8px;font-size:12px;color:#64748b">Model: —</div>
+        <div class="card">
+          <div class="card-title">Voice Command Examples</div>
+          <div style="font-size:13px;color:var(--dim);line-height:2.2">
+            🎙 <b style="color:var(--text)">"Light on karo"</b><br>
+            🎙 <b style="color:var(--text)">"Batti bujha do"</b><br>
+            🎙 <b style="color:var(--text)">"Turn off the light"</b><br>
+            🎙 <b style="color:var(--text)">"Kamra roshan karo"</b>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-title">ESP32 Connection</div>
+          <div id="esp32Status" style="font-size:24px;font-weight:800;color:var(--dim)">—</div>
+          <div style="font-size:11px;color:var(--dim);margin-top:4px">WebSocket status</div>
+        </div>
       </div>
 
-      <script>
-        async function load() {
-          const r = await fetch('/api/state').then(x => x.json());
-          const st = document.getElementById('status');
-          st.textContent = r.connected ? 'ESP32 Online' : 'ESP32 Offline';
-          st.className = 'badge ' + (r.connected ? 'on' : 'off');
-          if (!window.loadedOnce) {
-            document.getElementById('name').value = r.settings.name;
-            document.getElementById('prompt').value = r.settings.prompt;
-            document.getElementById('voice').value = r.settings.voice;
-            window.loadedOnce = true;
-          }
-          document.getElementById('logs').innerHTML = r.history.map(m =>
-            `<div class="msg"><b>${m.role.toUpperCase()}</b> <small>(${m.timestamp})</small>: ${m.content}</div>`
-          ).join('');
+      <!-- QUOTA -->
+      <div class="page" id="page-quota">
+        <div class="card">
+          <div class="card-title">Groq API Usage</div>
+          <div class="stat-grid">
+            <div class="stat-card">
+              <div class="stat-label">Requests Remaining</div>
+              <div class="stat-val" id="reqRem" style="color:var(--green)">—</div>
+              <div class="stat-sub" id="reqLim">of — | Reset: —</div>
+              <div class="bar-track"><div class="bar-fill" id="reqBar" style="width:0%;background:var(--green)"></div></div>
+            </div>
+            <div class="stat-card">
+              <div class="stat-label">Tokens Remaining</div>
+              <div class="stat-val" id="tokRem" style="color:var(--blue)">—</div>
+              <div class="stat-sub" id="tokLim">of — | Reset: —</div>
+              <div class="bar-track"><div class="bar-fill" id="tokBar" style="width:0%;background:var(--blue)"></div></div>
+            </div>
+          </div>
+          <div style="margin-top:14px;font-size:12px;color:var(--dim)" id="quotaNote">Send a message first to see quota data.</div>
+        </div>
+        <div class="card">
+          <div class="card-title">Active Model</div>
+          <div id="modelName" style="font-size:18px;font-weight:700;color:var(--silver)">—</div>
+        </div>
+      </div>
 
-          // Update quota card
-          const rl = r.rate_limit || {};
-          if (rl.req_remaining !== undefined && rl.req_remaining !== null) {
-            const rrem = parseInt(rl.req_remaining) || 0;
-            const rlim = parseInt(rl.req_limit) || 1;
-            const trem = parseInt(rl.tok_remaining) || 0;
-            const tlim = parseInt(rl.tok_limit) || 1;
-            const rPct = Math.round(rrem / rlim * 100);
-            const tPct = Math.round(trem / tlim * 100);
-            const rColor = rPct > 50 ? '#34d399' : rPct > 20 ? '#fbbf24' : '#f87171';
-            const tColor = tPct > 50 ? '#38bdf8' : tPct > 20 ? '#fbbf24' : '#f87171';
-            document.getElementById('reqRem').textContent = rrem.toLocaleString();
-            document.getElementById('reqRem').style.color = rColor;
-            document.getElementById('reqLim').textContent = `of ${rlim.toLocaleString()} | Reset: ${rl.req_reset || '—'}`;
-            document.getElementById('reqBar').style.width = rPct + '%';
-            document.getElementById('reqBar').style.background = rColor;
-            document.getElementById('tokRem').textContent = trem.toLocaleString();
-            document.getElementById('tokRem').style.color = tColor;
-            document.getElementById('tokLim').textContent = `of ${tlim.toLocaleString()} | Reset: ${rl.tok_reset || '—'}`;
-            document.getElementById('tokBar').style.width = tPct + '%';
-            document.getElementById('tokBar').style.background = tColor;
-            document.getElementById('quotaNote').textContent = 'Model: ' + (rl.model || '—');
-          } else {
-            document.getElementById('quotaNote').textContent = 'Pehle ek message send karo — phir quota yahan dikhega.';
-          }
-        }
-
-        async function sendTest() {
-          const inp = document.getElementById('testInput');
-          const box = document.getElementById('testReply');
-          const txt = inp.value.trim();
-          if (!txt) return;
-          box.textContent = '⏳ Thinking...';
-          box.style.color = '#94a3b8';
-          document.getElementById('speakBtn').style.display = 'none';
-          const res = await fetch('/api/test-chat', {
-            method: 'POST', headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({text: txt})
-          }).then(x => x.json());
-
-          if (res.error) {
-            box.style.color = '#f87171';
-            box.textContent = '❌ Error: ' + res.error;
-          } else {
-            box.style.color = '#38bdf8';
-            let out = res.reply;
-            if (res.iot && res.iot.length > 0) {
-              try {
-                const cmd = JSON.parse(res.iot[0]);
-                out += '  💡 [Light ' + (cmd.state === 'on' ? 'ON ✅' : 'OFF 🔴') + ']';
-              } catch(e) {}
-            }
-            box.textContent = out;
-            window._lastReply = res.reply;
-            document.getElementById('speakBtn').style.display = 'inline-block';
-            if (document.getElementById('autoSpeak').checked) {
-              speakText(res.reply);   // stopAudio() internally call hoti hai
-            }
-          }
-          inp.value = '';
-          load();
-        }
-
-        // ── Audio player: proper stop/start with no ghost playback ──
-        let currentAudio = null;
-        let audioStopped = false;   // Flag: user ne manually stop kiya
-
-        function stopAudio() {
-          audioStopped = true;
-          if (currentAudio) {
-            currentAudio.onended = null;   // Remove any callbacks
-            currentAudio.onerror = null;
-            currentAudio.pause();
-            currentAudio.src = '';         // Browser download cancel karo
-            currentAudio.load();           // Reset media element
-            currentAudio = null;
-          }
-          const btn = document.getElementById('speakBtn');
-          if (btn) { btn.textContent = '🔊 Dobara Suno'; btn.style.background = '#7c3aed'; }
-        }
-
-        function speakText(text) {
-          stopAudio();              // Pehle purana band karo
-          audioStopped = false;    // Reset flag for new play
-          const url = '/api/speak?text=' + encodeURIComponent(text);
-          currentAudio = new Audio();
-          currentAudio.preload = 'auto';
-
-          currentAudio.oncanplay = function() {
-            if (audioStopped) return;   // User ne stop kar diya tha
-            this.play().catch(() => {});
-            const btn = document.getElementById('speakBtn');
-            if (btn) { btn.textContent = '⏹ Stop'; btn.style.background = '#ef4444'; }
-          };
-          currentAudio.onended = function() {
-            const btn = document.getElementById('speakBtn');
-            if (btn) { btn.textContent = '🔊 Dobara Suno'; btn.style.background = '#7c3aed'; }
-            currentAudio = null;
-          };
-          currentAudio.onerror = function() {
-            currentAudio = null;
-          };
-          currentAudio.src = url;  // Src set karo — load shuru hoga
-        }
-
-        function toggleSpeak() {
-          if (currentAudio && !currentAudio.paused) {
-            stopAudio();   // Playing hai → Stop karo
-          } else {
-            if (window._lastReply) speakText(window._lastReply);  // Stopped hai → Play karo
-          }
-        }
-
-        function speakLast() {
-          if (window._lastReply) speakText(window._lastReply);
-        }
-
-        async function save() {
-          await fetch('/api/settings', {
-            method: 'POST', headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({
-              name: document.getElementById('name').value,
-              prompt: document.getElementById('prompt').value,
-              voice: document.getElementById('voice').value
-            })
-          });
-          alert('Saved!');
-        }
-        async function clearMem() { await fetch('/api/clear', {method: 'POST'}); load(); }
-        async function led(s) { await fetch('/api/led/' + s, {method: 'POST'}); }
-        load(); setInterval(load, 3000);
-      </script>
-    </body>
-    </html>
-    """
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    </div>
+  </div>
+</div>
+<script>
+  function showPage(id,navEl){
+    document.querySelectorAll('.page').forEach(p=>p.classList.remove('active'));
+    document.getElementById('page-'+id).classList.add('active');
+    document.querySelectorAll('.nav-item').forEach(n=>n.classList.remove('active'));
+    if(navEl)navEl.classList.add('active');
+    const t={chat:'Chat',settings:'Settings',history:'History',iot:'IoT / LED',quota:'API Quota'};
+    document.getElementById('pageTitle').textContent=t[id]||id;
+    if(id==='history')load();
+  }
+  let currentAudio=null,audioStopped=false;
+  function stopAudio(){
+    audioStopped=true;
+    if(currentAudio){currentAudio.onended=null;currentAudio.onerror=null;currentAudio.pause();currentAudio.src='';currentAudio.load();currentAudio=null;}
+    const b=document.getElementById('speakBtn');
+    if(b){b.textContent='🔊 Play';b.style.background='#2d1b69';}
+  }
+  function speakText(text){
+    stopAudio();audioStopped=false;
+    const url='/api/speak?text='+encodeURIComponent(text);
+    currentAudio=new Audio();currentAudio.preload='auto';
+    currentAudio.oncanplay=function(){
+      if(audioStopped)return;
+      this.play().catch(()=>{});
+      const b=document.getElementById('speakBtn');
+      if(b){b.textContent='⏹ Stop';b.style.background='#7f1d1d';}
+    };
+    currentAudio.onended=function(){
+      const b=document.getElementById('speakBtn');
+      if(b){b.textContent='🔊 Play';b.style.background='#2d1b69';}
+      currentAudio=null;
+    };
+    currentAudio.onerror=function(){currentAudio=null;};
+    currentAudio.src=url;
+  }
+  function toggleSpeak(){
+    if(currentAudio&&!currentAudio.paused)stopAudio();
+    else if(window._lastReply)speakText(window._lastReply);
+  }
+  function escH(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+  async function sendTest(){
+    const inp=document.getElementById('testInput');
+    const box=document.getElementById('chatBox');
+    const txt=inp.value.trim();if(!txt)return;
+    box.innerHTML+=`<div class="msg-row"><div class="msg-role user">You</div><div class="msg-bubble">${escH(txt)}</div></div>`;
+    const tid='t'+Date.now();
+    box.innerHTML+=`<div class="msg-row" id="${tid}"><div class="msg-role assistant">Jarvis</div><div class="msg-bubble typing">Thinking...</div></div>`;
+    box.scrollTop=box.scrollHeight;
+    document.getElementById('speakBtn').style.display='none';
+    inp.value='';
+    const res=await fetch('/api/test-chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text:txt})}).then(x=>x.json());
+    const te=document.getElementById(tid);if(te)te.remove();
+    if(res.error){
+      box.innerHTML+=`<div class="msg-row"><div class="msg-role assistant">Jarvis</div><div class="msg-bubble" style="color:var(--red)">Error: ${escH(res.error)}</div></div>`;
+    }else{
+      let iotTag='';
+      if(res.iot&&res.iot.length>0){try{const c=JSON.parse(res.iot[0]);iotTag=`<span style="font-size:11px;color:var(--green);margin-left:8px">💡 Light ${c.state.toUpperCase()}</span>`;}catch(e){}}
+      box.innerHTML+=`<div class="msg-row"><div class="msg-role assistant">Jarvis ${iotTag}</div><div class="msg-bubble">${escH(res.reply)}</div></div>`;
+      window._lastReply=res.reply;
+      document.getElementById('speakBtn').style.display='inline-flex';
+      if(document.getElementById('autoSpeak').checked)speakText(res.reply);
+    }
+    box.scrollTop=box.scrollHeight;
+    load();
+  }
+  async function saveSettings(){
+    await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:document.getElementById('name').value,prompt:document.getElementById('prompt').value,voice:document.getElementById('voice').value})});
+    const m=document.getElementById('saveMsg');m.style.display='block';setTimeout(()=>m.style.display='none',2500);
+  }
+  async function ledCtrl(s){await fetch('/api/led/'+s,{method:'POST'});}
+  async function clearMem(){await fetch('/api/clear',{method:'POST'});load();}
+  async function load(){
+    const r=await fetch('/api/state').then(x=>x.json());
+    const conn=r.connected;
+    const b=document.getElementById('espBadge');
+    b.textContent=conn?'ESP32 Online':'ESP32 Offline';b.className='badge '+(conn?'online':'offline');
+    document.getElementById('espDot').style.color=conn?'var(--green)':'var(--red)';
+    const es=document.getElementById('esp32Status');
+    if(es){es.textContent=conn?'🟢 Connected':'🔴 Disconnected';es.style.color=conn?'var(--green)':'var(--red)';}
+    if(!window.loadedOnce){
+      document.getElementById('name').value=r.settings.name;
+      document.getElementById('prompt').value=r.settings.prompt;
+      document.getElementById('voice').value=r.settings.voice;
+      window.loadedOnce=true;
+    }
+    const hl=document.getElementById('historyList');
+    if(hl){
+      if(r.history&&r.history.length>0){
+        hl.innerHTML=r.history.map(m=>`<div class="hist-item"><div class="hist-role ${m.role}">${m.role.toUpperCase()} <span class="hist-time">${m.timestamp}</span></div><div>${escH(m.content)}</div></div>`).join('');
+      }else{hl.innerHTML='<div style="color:var(--dim);font-size:13px">No history yet.</div>';}
+    }
+    const rl=r.rate_limit||{};
+    if(rl.req_remaining!=null){
+      const rr=parseInt(rl.req_remaining)||0,rl2=parseInt(rl.req_limit)||1;
+      const tr=parseInt(rl.tok_remaining)||0,tl=parseInt(rl.tok_limit)||1;
+      const rP=Math.round(rr/rl2*100),tP=Math.round(tr/tl*100);
+      const rC=rP>50?'var(--green)':rP>20?'var(--yellow)':'var(--red)';
+      const tC=tP>50?'var(--blue)':tP>20?'var(--yellow)':'var(--red)';
+      document.getElementById('reqRem').textContent=rr.toLocaleString();document.getElementById('reqRem').style.color=rC;
+      document.getElementById('reqLim').textContent=`of ${rl2.toLocaleString()} | Reset: ${rl.req_reset||'—'}`;
+      document.getElementById('reqBar').style.cssText=`width:${rP}%;background:${rC}`;
+      document.getElementById('tokRem').textContent=tr.toLocaleString();document.getElementById('tokRem').style.color=tC;
+      document.getElementById('tokLim').textContent=`of ${tl.toLocaleString()} | Reset: ${rl.tok_reset||'—'}`;
+      document.getElementById('tokBar').style.cssText=`width:${tP}%;background:${tC}`;
+      document.getElementById('quotaNote').textContent='';
+      const mn=document.getElementById('modelName');if(mn)mn.textContent=rl.model||'—';
+    }
+  }
+  load();setInterval(load,4000);
+</script>
+</body>
+</html>"""
