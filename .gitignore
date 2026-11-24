@@ -28,6 +28,8 @@ build/
 .DS_Store
 Thumbs.db
 
-# Arduino build output
+# Arduino / PlatformIO build output
+.pio/
+esp32_platformio/.pio/
 esp32/**/.cache/
 esp32/**/build/
