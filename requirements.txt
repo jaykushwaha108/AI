@@ -1,0 +1,8 @@
+fastapi
+uvicorn[standard]
+groq
+edge-tts
+imageio-ffmpeg
+python-dotenv
+websockets
+aiohttp
