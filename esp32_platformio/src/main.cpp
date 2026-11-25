@@ -39,6 +39,7 @@
 #include <Adafruit_SSD1306.h>
 #include <driver/i2s.h>
 #include <memory>
+#include <math.h>
 
 using namespace websockets;
 
@@ -100,6 +101,8 @@ unsigned long lastWifiAttempt = 0;
 enum State { IDLE, RECORDING, WAITING, PLAYING };
 volatile State state = IDLE;
 volatile bool aiLedState = false;
+volatile int speakerVolume = 80;       // 0..100%
+volatile uint16_t volumeScale = 183;   // 0..256 fixed-point perceptual gain
 
 // Audio Jitter / Ring Buffer Globals (Dual-task safe)
 portMUX_TYPE ringMux = portMUX_INITIALIZER_UNLOCKED;
@@ -217,6 +220,27 @@ void saveServerConfig() {
   prefs.putString("ip",   serverIP);
   prefs.putString("port", serverPort);
   prefs.end();
+}
+
+void setSpeakerVolume(int pct, bool saveToPrefs = true) {
+  pct = constrain(pct, 0, 100);
+  speakerVolume = pct;
+  // Perceptual loudness curve: pow(pct/100, 1.5) mapped to 0..256
+  float gain = powf((float)pct / 100.0f, 1.5f);
+  volumeScale = (uint16_t)roundf(gain * 256.0f);
+  if (saveToPrefs) {
+    prefs.begin("jarvis", false);
+    prefs.putInt("vol", pct);
+    prefs.end();
+  }
+  Serial.printf("[Audio] Volume set to %d%% (scale=%u/256)\n", pct, (unsigned)volumeScale);
+}
+
+void loadSpeakerVolume() {
+  prefs.begin("jarvis", true);
+  int pct = prefs.getInt("vol", 80);
+  prefs.end();
+  setSpeakerVolume(pct, false);
 }
 
 void loadServerConfig() {
@@ -493,6 +517,7 @@ void audioPlaybackTask(void* param) {
     }
 
     size_t toCopy = (countSnap > sizeof(txChunk)) ? sizeof(txChunk) : countSnap;
+    if (toCopy >= 2) toCopy &= ~((size_t)1); // Keep 16-bit PCM sample alignment
     portENTER_CRITICAL(&ringMux);
     size_t firstPart = AUDIO_RING_SIZE - ringTail;
     if (firstPart > toCopy) firstPart = toCopy;
@@ -503,6 +528,18 @@ void audioPlaybackTask(void* param) {
     ringTail = (ringTail + toCopy) % AUDIO_RING_SIZE;
     ringCount -= toCopy;
     portEXIT_CRITICAL(&ringMux);
+
+    // Apply digital volume scaling (0..256 fixed-point)
+    uint16_t scale = volumeScale;
+    if (scale == 0) {
+      memset(txChunk, 0, toCopy);
+    } else if (scale != 256) {
+      int16_t* samples = (int16_t*)txChunk;
+      size_t numSamples = toCopy / 2;
+      for (size_t i = 0; i < numSamples; i++) {
+        samples[i] = (int16_t)(((int32_t)samples[i] * scale) >> 8);
+      }
+    }
 
     size_t written = 0;
     i2s_write(I2S_SPK_PORT, txChunk, toCopy, &written, portMAX_DELAY);
@@ -552,13 +589,22 @@ void onWsMessage(WebsocketsMessage msg) {
     }
     portEXIT_CRITICAL(&ringMux);
   } else if (strcmp(type, "iot") == 0) {
-    const char* action   = doc["action"] | "";
-    const char* ledstate = doc["state"]  | "off";
+    const char* action = doc["action"] | "";
     if (strcmp(action, "led") == 0) {
+      const char* ledstate = doc["state"] | "off";
       bool on = (strcmp(ledstate, "on") == 0);
       ledSet(on);
       Serial.printf("[IoT] LED State -> %s\n", ledstate);
-      updateOled(on ? "IoT: LED ON" : "IoT: LED OFF", "Updated by AI", "Ready", on ? "LED: ON" : "LED: OFF");
+      char foot[32];
+      snprintf(foot, sizeof(foot), "LED:%s | Vol:%d%%", on ? "ON" : "OFF", (int)speakerVolume);
+      updateOled(on ? "IoT: LED ON" : "IoT: LED OFF", "Updated by AI", "Ready", foot);
+    } else if (strcmp(action, "volume") == 0) {
+      int level = doc["level"] | 80;
+      setSpeakerVolume(level, true);
+      char volLine[32], foot[32];
+      snprintf(volLine, sizeof(volLine), "Level: %d%%", (int)speakerVolume);
+      snprintf(foot, sizeof(foot), "LED:%s | Vol:%d%%", aiLedState ? "ON" : "OFF", (int)speakerVolume);
+      updateOled("Speaker Volume", volLine, "Saved to ESP32", foot);
     }
   }
 }
@@ -567,7 +613,9 @@ void onWsEvent(WebsocketsEvent event, String data) {
   if (event == WebsocketsEvent::ConnectionOpened) {
     wsConnected = true;
     Serial.println(F("[WS] Connected to Jarvis Server!"));
-    updateOled("Server Connected!", "Status: Ready", "Hold BOOT to talk", aiLedState ? "LED: ON" : "LED: OFF");
+    char foot[32];
+    snprintf(foot, sizeof(foot), "LED:%s | Vol:%d%%", aiLedState ? "ON" : "OFF", (int)speakerVolume);
+    updateOled("Server Connected!", "Status: Ready", "Hold BOOT to talk", foot);
     blinkLED(2, 120);
   } else if (event == WebsocketsEvent::ConnectionClosed) {
     wsConnected = false;
@@ -775,6 +823,7 @@ void setup() {
   blinkLED(1, 300);
 
   setupWiFi();
+  loadSpeakerVolume();
   setupMic();
   setupSpeaker();
   xTaskCreatePinnedToCore(audioPlaybackTask, "AudioPlay", 4096, NULL, 2, NULL, 1);
@@ -787,7 +836,9 @@ void loop() {
   // Safe OLED update triggered by background AudioPlay task when speech finishes
   if (oledReadyPending) {
     oledReadyPending = false;
-    updateOled("Status: Ready", "Hold BOOT to talk", "Server: Connected", aiLedState ? "LED: ON" : "LED: OFF");
+    char foot[32];
+    snprintf(foot, sizeof(foot), "LED:%s | Vol:%d%%", aiLedState ? "ON" : "OFF", (int)speakerVolume);
+    updateOled("Status: Ready", "Hold BOOT to talk", "Server: Connected", foot);
   }
 
   // 1. Always check BOOT button FIRST (works even if WiFi/WS is offline!)

@@ -91,7 +91,8 @@ def init_db():
         "name": "Jarvis",
         "prompt": "Tum ek ultra-smart, friendly aur natural human-like AI companion ho, bilkul ChatGPT aur Gemini ki tarah. Baat karne ka andaaz natural, casual aur empathetic hona chahiye (Hindi/Hinglish). Current facts: Current year 2026 hai. India me 28 states aur 8 UTs hain. Madhya Pradesh ke Chief Minister Dr. Mohan Yadav hain. PM Narendra Modi hain. Agar user tumhe correct kare ya bole galat answer hai to bina behes kiye vinamrata se samjho aur update do. Response short, clear aur natural 1-3 sentences me do.",
         "voice": "hi-IN-SwaraNeural",
-        "model": "openai/gpt-oss-120b"
+        "model": "openai/gpt-oss-120b",
+        "volume": "80"
     }
     for k, v in defaults.items():
         c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (k, v))
@@ -155,6 +156,25 @@ TOOLS = [
                 "required": ["state"]
             }
         }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "set_volume",
+            "description": "Call this ONLY when the user explicitly asks to change, increase, decrease, mute, or set the speaker volume (e.g. 'volume high karo', 'volume low karo', 'volume medium karo', 'awaz tez karo', 'awaz kam karo', 'volume 40% karo', 'mute kar do').",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "level": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 100,
+                        "description": "Target volume percentage from 0 to 100. Presets: mute=0, low=25, medium=55, high=85, full/max=100. If user asks to increase/decrease slightly, adjust relative to current volume."
+                    }
+                },
+                "required": ["level"]
+            }
+        }
     }
 ]
 
@@ -201,7 +221,8 @@ async def ask_llm(user_text: str, ws) -> str:
     settings = get_settings()
     history = get_history(limit=10)
 
-    messages = [{"role": "system", "content": f"Your name is {settings['name']}. {settings['prompt']}"}]
+    cur_vol = settings.get("volume", "80")
+    messages = [{"role": "system", "content": f"Your name is {settings['name']}. {settings['prompt']} Current ESP32 speaker volume is {cur_vol}%."}]
     for h in history:
         messages.append({"role": h["role"], "content": h["content"]})
     messages.append({"role": "user", "content": user_text})
@@ -237,6 +258,14 @@ async def ask_llm(user_text: str, ws) -> str:
                 state = args.get("state", "off")
                 await ws.send_text(json.dumps({"type": "iot", "action": "led", "state": state}))
                 return f"Light {state} kar di hai."
+            elif tc.function.name == "set_volume":
+                args = json.loads(tc.function.arguments)
+                level = max(0, min(100, int(args.get("level", 80))))
+                save_settings({"volume": str(level)})
+                await ws.send_text(json.dumps({"type": "iot", "action": "volume", "level": level}))
+                if level == 0:
+                    return "Speaker mute kar diya hai."
+                return f"Volume {level} percent set kar diya hai."
 
     content = msg.content
     if not content and hasattr(msg, "reasoning") and msg.reasoning:
@@ -271,6 +300,11 @@ async def esp32_ws(ws: WebSocket):
     await ws.accept()
     active_esp32 = ws
     print("[ESP32] Connected!")
+    try:
+        saved_vol = int(get_settings().get("volume", "80"))
+        await ws.send_text(json.dumps({"type": "iot", "action": "volume", "level": saved_vol}))
+    except Exception:
+        pass
     audio_buffer = bytearray()
 
     try:
@@ -372,6 +406,15 @@ async def api_led(state: str):
         await active_esp32.send_text(json.dumps({"type": "iot", "action": "led", "state": state}))
         return {"ok": True}
     return {"ok": False, "error": "ESP32 not connected"}
+
+@app.post("/api/volume/{level}")
+async def api_volume(level: int):
+    level = max(0, min(100, level))
+    save_settings({"volume": str(level)})
+    if active_esp32:
+        await active_esp32.send_text(json.dumps({"type": "iot", "action": "volume", "level": level}))
+        return {"ok": True, "level": level}
+    return {"ok": True, "level": level, "note": "Saved (ESP32 offline, will sync on connect)"}
 
 @app.get("/api/speak")
 async def api_speak(text: str):
@@ -590,14 +633,31 @@ async def dashboard():
               <button class="btn btn-red btn-sm" onclick="ledCtrl('off')">OFF</button>
             </div>
           </div>
+          <div class="iot-row" style="flex-direction:column;align-items:stretch;gap:12px">
+            <div style="display:flex;justify-content:space-between;align-items:center">
+              <div>
+                <div style="font-size:14px;font-weight:600">🔊 Speaker Volume</div>
+                <div style="font-size:11px;color:var(--dim);margin-top:2px">ESP32 I2S Amplifier (0% – 100%)</div>
+              </div>
+              <span id="volVal" style="font-size:18px;font-weight:800;color:var(--red)">80%</span>
+            </div>
+            <input type="range" id="volSlider" min="0" max="100" value="80" style="width:100%;accent-color:var(--red);cursor:pointer" oninput="document.getElementById('volVal').textContent=this.value+'%'" onchange="setVolume(this.value)">
+            <div class="btn-row">
+              <button class="btn btn-ghost btn-sm" onclick="setVolume(0)">🔇 Mute</button>
+              <button class="btn btn-ghost btn-sm" onclick="setVolume(25)">🔉 Low (25%)</button>
+              <button class="btn btn-ghost btn-sm" onclick="setVolume(55)">🔊 Med (55%)</button>
+              <button class="btn btn-ghost btn-sm" onclick="setVolume(85)">📢 High (85%)</button>
+              <button class="btn btn-ghost btn-sm" onclick="setVolume(100)">🔥 Max (100%)</button>
+            </div>
+          </div>
         </div>
         <div class="card">
           <div class="card-title">Voice Command Examples</div>
           <div style="font-size:13px;color:var(--dim);line-height:2.2">
-            🎙 <b style="color:var(--text)">"Light on karo"</b><br>
-            🎙 <b style="color:var(--text)">"Batti bujha do"</b><br>
-            🎙 <b style="color:var(--text)">"Turn off the light"</b><br>
-            🎙 <b style="color:var(--text)">"Kamra roshan karo"</b>
+            🎙 <b style="color:var(--text)">"Light on karo"</b> / <b style="color:var(--text)">"Batti bujha do"</b><br>
+            🎙 <b style="color:var(--text)">"Volume high karo"</b> / <b style="color:var(--text)">"Volume low karo"</b><br>
+            🎙 <b style="color:var(--text)">"Volume medium kar do"</b> / <b style="color:var(--text)">"Volume 40% karo"</b><br>
+            🎙 <b style="color:var(--text)">"Awaz thodi tez karo"</b> / <b style="color:var(--text)">"Speaker mute karo"</b>
           </div>
         </div>
         <div class="card">
@@ -692,7 +752,7 @@ async def dashboard():
       box.innerHTML+=`<div class="msg-row"><div class="msg-role assistant">Jarvis</div><div class="msg-bubble" style="color:var(--red)">Error: ${escH(res.error)}</div></div>`;
     }else{
       let iotTag='';
-      if(res.iot&&res.iot.length>0){try{const c=JSON.parse(res.iot[0]);iotTag=`<span style="font-size:11px;color:var(--green);margin-left:8px">💡 Light ${c.state.toUpperCase()}</span>`;}catch(e){}}
+      if(res.iot&&res.iot.length>0){try{const c=JSON.parse(res.iot[0]);if(c.action==='led')iotTag=`<span style="font-size:11px;color:var(--green);margin-left:8px">💡 Light ${c.state.toUpperCase()}</span>`;else if(c.action==='volume')iotTag=`<span style="font-size:11px;color:var(--blue);margin-left:8px">🔊 Vol ${c.level}%</span>`;}catch(e){}}
       box.innerHTML+=`<div class="msg-row"><div class="msg-role assistant">Jarvis ${iotTag}</div><div class="msg-bubble">${escH(res.reply)}</div></div>`;
       window._lastReply=res.reply;
       document.getElementById('speakBtn').style.display='inline-flex';
@@ -706,6 +766,12 @@ async def dashboard():
     const m=document.getElementById('saveMsg');m.style.display='block';setTimeout(()=>m.style.display='none',2500);
   }
   async function ledCtrl(s){await fetch('/api/led/'+s,{method:'POST'});}
+  async function setVolume(v){
+    v=Math.max(0,Math.min(100,parseInt(v)||0));
+    document.getElementById('volSlider').value=v;
+    document.getElementById('volVal').textContent=v+'%';
+    await fetch('/api/volume/'+v,{method:'POST'});
+  }
   async function clearMem(){await fetch('/api/clear',{method:'POST'});load();}
   async function load(){
     const r=await fetch('/api/state').then(x=>x.json());
@@ -720,6 +786,13 @@ async def dashboard():
       document.getElementById('prompt').value=r.settings.prompt;
       document.getElementById('voice').value=r.settings.voice;
       window.loadedOnce=true;
+    }
+    if(r.settings&&r.settings.volume!==undefined){
+      const v=parseInt(r.settings.volume);
+      if(!isNaN(v)){
+        document.getElementById('volSlider').value=v;
+        document.getElementById('volVal').textContent=v+'%';
+      }
     }
     const hl=document.getElementById('historyList');
     if(hl){
