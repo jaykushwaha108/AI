@@ -74,8 +74,10 @@ public:
 #define SPK_DOUT      33    // DIN
 
 // ─────────────────── AUDIO CONFIG ───────────────────────────
-#define SAMPLE_RATE   16000
-#define MIC_BUF_LEN   512   // Mono samples per WS packet (32ms)
+#define SAMPLE_RATE     16000
+#define MIC_BUF_LEN     512     // Mono samples per WS packet (32ms)
+#define AUDIO_RING_SIZE 65536   // 64 KB RAM ring buffer (~2.05s of 16kHz audio)
+#define PREBUFFER_BYTES 8192    // Buffer 8 KB (~256ms) before starting speaker
 
 // ─────────────────── CONFIG DEFAULTS ────────────────────────
 #define AP_NAME        "Jarvis-Setup"
@@ -98,6 +100,14 @@ unsigned long lastWifiAttempt = 0;
 enum State { IDLE, RECORDING, WAITING, PLAYING };
 State state = IDLE;
 bool aiLedState = false;
+
+// Audio Jitter / Ring Buffer Globals
+static uint8_t audioRing[AUDIO_RING_SIZE];
+size_t ringHead = 0;
+size_t ringTail = 0;
+size_t ringCount = 0;
+bool playbackStarted = false;
+bool audioStreamEnded = false;
 
 // ════════════════════════════════════════════════════════════
 //  OLED DISPLAY HELPERS
@@ -378,7 +388,7 @@ void setupSpeaker() {
     .communication_format = I2S_COMM_FORMAT_STAND_I2S,
     .intr_alloc_flags     = ESP_INTR_FLAG_LEVEL1,
     .dma_buf_count        = 8,
-    .dma_buf_len          = 128,
+    .dma_buf_len          = 512,  // 256ms hardware DMA buffer (smooth!)
     .use_apll             = false,
     .tx_desc_auto_clear   = true,
     .fixed_mclk           = 0
@@ -395,14 +405,76 @@ void setupSpeaker() {
 }
 
 // ════════════════════════════════════════════════════════════
+//  AUDIO RING BUFFER HELPERS (Eliminates network stutter!)
+// ════════════════════════════════════════════════════════════
+void resetAudioRing() {
+  ringHead = 0;
+  ringTail = 0;
+  ringCount = 0;
+  playbackStarted = false;
+  audioStreamEnded = false;
+}
+
+void drainRingToI2S(bool allowWait) {
+  if (state != PLAYING) return;
+  if (!playbackStarted) {
+    if (ringCount >= PREBUFFER_BYTES || (audioStreamEnded && ringCount > 0)) {
+      playbackStarted = true;
+    } else {
+      return;
+    }
+  }
+
+  while (ringCount > 0) {
+    size_t contiguous = AUDIO_RING_SIZE - ringTail;
+    size_t chunk = (ringCount < contiguous) ? ringCount : contiguous;
+    if (chunk > 2048) chunk = 2048;
+
+    size_t written = 0;
+    i2s_write(I2S_SPK_PORT, audioRing + ringTail, chunk, &written,
+              allowWait ? (20 / portTICK_PERIOD_MS) : 0);
+
+    if (written == 0) break; // DMA full right now; try next loop iteration
+    ringTail = (ringTail + written) % AUDIO_RING_SIZE;
+    ringCount -= written;
+  }
+}
+
+void pushAudioRing(const uint8_t* data, size_t len) {
+  size_t offset = 0;
+  while (offset < len) {
+    size_t freeSpace = AUDIO_RING_SIZE - ringCount;
+    if (freeSpace == 0) {
+      playbackStarted = true;
+      drainRingToI2S(true);
+      freeSpace = AUDIO_RING_SIZE - ringCount;
+      if (freeSpace == 0) {
+        delay(2);
+        continue;
+      }
+    }
+    size_t toWrite = len - offset;
+    if (toWrite > freeSpace) toWrite = freeSpace;
+    size_t firstPart = AUDIO_RING_SIZE - ringHead;
+    if (firstPart > toWrite) firstPart = toWrite;
+
+    memcpy(audioRing + ringHead, data + offset, firstPart);
+    if (toWrite > firstPart) {
+      memcpy(audioRing, data + offset + firstPart, toWrite - firstPart);
+    }
+    ringHead = (ringHead + toWrite) % AUDIO_RING_SIZE;
+    ringCount += toWrite;
+    offset += toWrite;
+  }
+}
+
+// ════════════════════════════════════════════════════════════
 //  WEBSOCKET CLIENT
 // ════════════════════════════════════════════════════════════
 void onWsMessage(WebsocketsMessage msg) {
   if (msg.isBinary()) {
     if (state == PLAYING) {
-      const uint8_t* data = (const uint8_t*)msg.c_str();
-      size_t written = 0;
-      i2s_write(I2S_SPK_PORT, data, msg.length(), &written, portMAX_DELAY);
+      pushAudioRing((const uint8_t*)msg.c_str(), msg.length());
     }
     return;
   }
@@ -425,16 +497,16 @@ void onWsMessage(WebsocketsMessage msg) {
   } else if (strcmp(type, "audio_start") == 0) {
     const char* textSnippet = doc["text"] | "";
     Serial.printf("[Jarvis Speaking] %s...\n", textSnippet);
+    resetAudioRing();
     state = PLAYING;
     i2s_zero_dma_buffer(I2S_SPK_PORT);
-    updateOled("Speaking...", textSnippet, "Audio playback", aiLedState ? "LED: ON" : "LED: OFF");
+    updateOled("Speaking...", textSnippet, "Buffering audio...", aiLedState ? "LED: ON" : "LED: OFF");
   } else if (strcmp(type, "audio_end") == 0) {
-    Serial.println(F("[Audio] Playback complete."));
-    delay(200);
-    i2s_zero_dma_buffer(I2S_SPK_PORT);
-    state = IDLE;
-    digitalWrite(LED_PIN, aiLedState ? HIGH : LOW);
-    updateOled("Status: Ready", "Hold BOOT to talk", "Server: Connected", aiLedState ? "LED: ON" : "LED: OFF");
+    Serial.println(F("[Audio] Stream received completely. Draining buffer..."));
+    audioStreamEnded = true;
+    if (!playbackStarted && ringCount > 0) {
+      playbackStarted = true;
+    }
   } else if (strcmp(type, "iot") == 0) {
     const char* action   = doc["action"] | "";
     const char* ledstate = doc["state"]  | "off";
@@ -456,6 +528,8 @@ void onWsEvent(WebsocketsEvent event, String data) {
   } else if (event == WebsocketsEvent::ConnectionClosed) {
     wsConnected = false;
     state = IDLE;
+    resetAudioRing();
+    i2s_zero_dma_buffer(I2S_SPK_PORT);
     Serial.println(F("[WS] Connection lost."));
     updateOled("Server Offline", "Retrying connection...", serverIP, "Status: Reconnecting");
   } else if (event == WebsocketsEvent::GotPing) {
@@ -691,5 +765,22 @@ void loop() {
   }
 
   if (ws) ws->poll();
+
+  // 4. Smooth Audio Playback from 64KB Ring Buffer
+  if (state == PLAYING) {
+    drainRingToI2S(false);
+    if (audioStreamEnded && ringCount == 0) {
+      delay(280); // Wait for 256ms hardware DMA tail to finish speaking
+      i2s_zero_dma_buffer(I2S_SPK_PORT);
+      resetAudioRing();
+      state = IDLE;
+      digitalWrite(LED_PIN, aiLedState ? HIGH : LOW);
+      Serial.println(F("[Audio] Playback complete."));
+      updateOled("Status: Ready", "Hold BOOT to talk", "Server: Connected", aiLedState ? "LED: ON" : "LED: OFF");
+    }
+    delay(1);
+    return;
+  }
+
   delay(10);
 }
