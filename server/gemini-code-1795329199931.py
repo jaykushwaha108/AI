@@ -4,6 +4,8 @@ import io
 import re
 import json
 import wave
+import math
+import array
 import sqlite3
 import asyncio
 import subprocess
@@ -165,14 +167,34 @@ def pcm_to_wav(pcm_bytes: bytes, sample_rate=16000) -> bytes:
         wf.writeframes(pcm_bytes)
     return buf.getvalue()
 
+SILENCE_HALLUCINATIONS = {
+    "thank you.", "thank you", "thanks for watching.", "thanks for watching",
+    "you", "you.", "bye.", "bye", "subtitles by", "amara.org"
+}
+
 def transcribe_audio(pcm_bytes: bytes) -> str:
-    wav_bytes = pcm_to_wav(pcm_bytes)
+    usable_len = len(pcm_bytes) - (len(pcm_bytes) % 2)
+    if usable_len < 3200:
+        return ""
+    samples = array.array("h")
+    samples.frombytes(pcm_bytes[:usable_len])
+    peak = max((abs(s) for s in samples), default=0)
+    rms = math.sqrt(sum(s * s for s in samples) / len(samples)) if samples else 0.0
+    print(f"[AUDIO] bytes={usable_len}, peak={peak}, rms={rms:.1f}")
+    if peak < 150 or rms < 30:
+        return ""
+
+    wav_bytes = pcm_to_wav(pcm_bytes[:usable_len])
     resp = groq_client.audio.transcriptions.create(
         file=("audio.wav", wav_bytes),
         model="whisper-large-v3-turbo",
         response_format="text"
     )
-    return resp.strip()
+    text = resp.strip()
+    if rms < 120 and text.lower() in SILENCE_HALLUCINATIONS:
+        print(f"[AUDIO] Filtered Whisper hallucination on low RMS ({rms:.1f}): {text!r}")
+        return ""
+    return text
 
 async def ask_llm(user_text: str, ws) -> str:
     global rate_limit_info

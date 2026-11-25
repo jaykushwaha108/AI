@@ -32,13 +32,23 @@
 #include <Wire.h>
 #include <WiFiManager.h>
 #include <ArduinoWebsockets.h>
+#include <tiny_websockets/network/esp32/esp32_tcp.hpp>
 #include <ArduinoJson.h>
 #include <Preferences.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include <driver/i2s.h>
+#include <memory>
 
 using namespace websockets;
+
+// SSL TcpClient for Render (wss:// on port 443) without hardcoded CA expiry issues
+class InsecureSslTcpClient : public websockets::network::SecuredEsp32TcpClient {
+public:
+  InsecureSslTcpClient() {
+    this->client.setInsecure();
+  }
+};
 
 // ─────────────────── PIN DEFINITIONS ────────────────────────
 #define LED_PIN       18    // Status / AI-controlled LED
@@ -65,22 +75,25 @@ using namespace websockets;
 
 // ─────────────────── AUDIO CONFIG ───────────────────────────
 #define SAMPLE_RATE   16000
-#define MIC_BUF_LEN   256
+#define MIC_BUF_LEN   512   // Mono samples per WS packet (32ms)
 
 // ─────────────────── CONFIG DEFAULTS ────────────────────────
 #define AP_NAME        "Jarvis-Setup"
 #define AP_PASS        "12345678"
 #define SERVER_IP_MAX  64
+#define RESET_HOLD_MS  7000   // Hold BOOT button 7 seconds -> Open WiFi Setup AP
 
 // ─────────────────── GLOBALS ────────────────────────────────
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
-WebsocketsClient ws;
+std::unique_ptr<WebsocketsClient> ws;
 Preferences prefs;
 
 bool wsConnected = false;
 bool oledFound = false;
-char serverIP[SERVER_IP_MAX] = "192.168.1.100";
-char serverPort[8]           = "8000";
+char serverIP[SERVER_IP_MAX] = "ai-wur3.onrender.com";
+char serverPort[8]           = "443";
+unsigned long lastWsAttempt   = 0;
+unsigned long lastWifiAttempt = 0;
 
 enum State { IDLE, RECORDING, WAITING, PLAYING };
 State state = IDLE;
@@ -155,7 +168,38 @@ void ledSet(bool on) {
   digitalWrite(LED_PIN, on ? HIGH : LOW);
 }
 
+void normalizeServerConfig() {
+  String host = String(serverIP);
+  host.trim();
+  bool isHttps = host.startsWith("https://") || host.startsWith("wss://");
+  if (host.startsWith("https://")) host.remove(0, 8);
+  else if (host.startsWith("http://")) host.remove(0, 7);
+  else if (host.startsWith("wss://")) host.remove(0, 6);
+  else if (host.startsWith("ws://")) host.remove(0, 5);
+
+  int slashIdx = host.indexOf('/');
+  if (slashIdx != -1) host = host.substring(0, slashIdx);
+
+  int colonIdx = host.indexOf(':');
+  if (colonIdx != -1) {
+    String portPart = host.substring(colonIdx + 1);
+    host = host.substring(0, colonIdx);
+    if (portPart.length() > 0) {
+      portPart.toCharArray(serverPort, 8);
+    }
+  }
+
+  if (isHttps || host.endsWith(".onrender.com")) {
+    if (atoi(serverPort) == 8000 || strlen(serverPort) == 0) {
+      strcpy(serverPort, "443");
+    }
+  }
+
+  host.toCharArray(serverIP, SERVER_IP_MAX);
+}
+
 void saveServerConfig() {
+  normalizeServerConfig();
   prefs.begin("jarvis", false);
   prefs.putString("ip",   serverIP);
   prefs.putString("port", serverPort);
@@ -167,43 +211,59 @@ void loadServerConfig() {
   String ip   = prefs.getString("ip",   serverIP);
   String port = prefs.getString("port", serverPort);
   prefs.end();
+  if (ip == "192.168.1.100" || ip.length() == 0) {
+    ip = "ai-wur3.onrender.com";
+    port = "443";
+  }
   ip.toCharArray(serverIP, SERVER_IP_MAX);
   port.toCharArray(serverPort, 8);
+  normalizeServerConfig();
 }
 
 // ════════════════════════════════════════════════════════════
-//  WIFIMANAGER SETUP
+//  WIFIMANAGER SETUP (Boot + On-Demand 7s Reset Portal)
 // ════════════════════════════════════════════════════════════
-void setupWiFi() {
-  loadServerConfig();
-
-  WiFiManager wm;
-  wm.setTitle("Jarvis Configuration");
+void configureWiFiManager(WiFiManager& wm, WiFiManagerParameter& p_ip, WiFiManagerParameter& p_port) {
+  wm.setTitle("Jarvis WiFi Setup");
   wm.setDarkMode(true);
-
-  WiFiManagerParameter p_ip("server_ip", "Server Host / IP", serverIP, SERVER_IP_MAX);
-  WiFiManagerParameter p_port("server_port", "Server Port", serverPort, 8);
+  wm.setConnectTimeout(20);
+  wm.setConnectRetries(3);
+  wm.setCleanConnect(true);
   wm.addParameter(&p_ip);
   wm.addParameter(&p_port);
 
-  // Check if BOOT button held at boot
+  wm.setAPCallback([](WiFiManager* wm) {
+    Serial.println(F("========================================"));
+    Serial.println(F("  Jarvis Setup Hotspot Active!"));
+    Serial.printf ("  SSID: %s | PASS: %s\n", AP_NAME, AP_PASS);
+    Serial.println(F("  Open browser: http://192.168.4.1"));
+    Serial.println(F("========================================"));
+    char apLine[32], passLine[32];
+    snprintf(apLine, sizeof(apLine), "WiFi: %s", AP_NAME);
+    snprintf(passLine, sizeof(passLine), "Pass: %s", AP_PASS);
+    updateOled("Setup Hotspot ON", apLine, passLine, "Open: 192.168.4.1");
+  });
+}
+
+void setupWiFi() {
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  loadServerConfig();
+
+  WiFiManager wm;
+  WiFiManagerParameter p_ip("server_ip", "Server Host / IP", serverIP, SERVER_IP_MAX);
+  WiFiManagerParameter p_port("server_port", "Server Port", serverPort, 8);
+  configureWiFiManager(wm, p_ip, p_port);
+
+  // Check if BOOT button held at power-on
   pinMode(BTN_PIN, INPUT_PULLUP);
   delay(100);
   if (digitalRead(BTN_PIN) == LOW) {
-    Serial.println(F("[WiFi] BOOT button held - resetting WiFi settings..."));
+    Serial.println(F("[WiFi] BOOT button held at boot - resetting WiFi settings..."));
     updateOled("WiFi Reset!", "Clearing saved WiFi", "Starting Setup AP...");
     blinkLED(6, 60);
     wm.resetSettings();
   }
-
-  wm.setAPCallback([](WiFiManager* wm) {
-    Serial.println(F("========================================"));
-    Serial.println(F("  Jarvis-Setup Hotspot Active!"));
-    Serial.printf ("  SSID: %s | PASS: %s\n", AP_NAME, AP_PASS);
-    Serial.println(F("  Open browser: http://192.168.4.1"));
-    Serial.println(F("========================================"));
-    updateOled("Hotspot Setup AP", "Connect: Jarvis-Setup", "Pass: 12345678", "Open: 192.168.4.1");
-  });
 
   updateOled("Connecting WiFi...", "Connecting to router...", serverIP);
 
@@ -226,11 +286,59 @@ void setupWiFi() {
 
   char ipLine[32];
   snprintf(ipLine, sizeof(ipLine), "IP: %s", WiFi.localIP().toString().c_str());
-  char srvLine[32];
+  char srvLine[80];
   snprintf(srvLine, sizeof(srvLine), "Srv: %s:%s", serverIP, serverPort);
-  updateOled("WiFi Connected!", ipLine, srvLine, "Status: Ready");
+  updateOled("WiFi Connected!", ipLine, srvLine, "Connecting Server...");
 
   blinkLED(3, 120);
+}
+
+void openWiFiSetupPortal() {
+  Serial.println(F("[Setup] Launching WiFi Setup Portal (AP Mode)..."));
+  if (ws) {
+    ws->close();
+    ws.reset();
+  }
+  wsConnected = false;
+  state = IDLE;
+
+  blinkLED(5, 70);
+  updateOled("WiFi Setup Mode", "Clearing old WiFi...", "Starting Hotspot...");
+
+  // Reset server config to Render default if user resets
+  strcpy(serverIP, "ai-wur3.onrender.com");
+  strcpy(serverPort, "443");
+
+  WiFiManager wm;
+  wm.resetSettings();
+  WiFi.disconnect(true, true);
+  delay(300);
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+
+  WiFiManagerParameter p_ip("server_ip", "Server Host / IP", serverIP, SERVER_IP_MAX);
+  WiFiManagerParameter p_port("server_port", "Server Port", serverPort, 8);
+  configureWiFiManager(wm, p_ip, p_port);
+
+  // Blocks until user enters new SSID/password and ESP32 connects, then auto-closes AP & portal!
+  if (wm.startConfigPortal(AP_NAME, AP_PASS)) {
+    String newIP   = p_ip.getValue();
+    String newPort = p_port.getValue();
+    if (newIP.length() > 0)   newIP.toCharArray(serverIP, SERVER_IP_MAX);
+    if (newPort.length() > 0) newPort.toCharArray(serverPort, 8);
+    saveServerConfig();
+
+    char ipLine[32];
+    snprintf(ipLine, sizeof(ipLine), "IP: %s", WiFi.localIP().toString().c_str());
+    updateOled("WiFi Connected!", ipLine, "Portal Closed!", "Connecting Server...");
+    Serial.println(F("[Setup] New WiFi connected & portal closed!"));
+    blinkLED(3, 120);
+    lastWsAttempt = 0; // Connect immediately
+  } else {
+    updateOled("Setup Cancelled", "Restarting ESP32...");
+    delay(1500);
+    ESP.restart();
+  }
 }
 
 // ════════════════════════════════════════════════════════════
@@ -241,11 +349,11 @@ void setupMic() {
     .mode                 = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
     .sample_rate          = SAMPLE_RATE,
     .bits_per_sample      = I2S_BITS_PER_SAMPLE_32BIT,
-    .channel_format       = I2S_CHANNEL_FMT_ONLY_LEFT,
+    .channel_format       = I2S_CHANNEL_FMT_RIGHT_LEFT, // Read both slots (fixes ESP32 IDF L/R swap!)
     .communication_format = I2S_COMM_FORMAT_STAND_I2S,
     .intr_alloc_flags     = ESP_INTR_FLAG_LEVEL1,
     .dma_buf_count        = 8,
-    .dma_buf_len          = 128,
+    .dma_buf_len          = 256,
     .use_apll             = false,
     .tx_desc_auto_clear   = false,
     .fixed_mclk           = 0
@@ -351,68 +459,184 @@ void onWsEvent(WebsocketsEvent event, String data) {
     Serial.println(F("[WS] Connection lost."));
     updateOled("Server Offline", "Retrying connection...", serverIP, "Status: Reconnecting");
   } else if (event == WebsocketsEvent::GotPing) {
-    ws.pong();
+    if (ws) ws->pong();
   }
 }
 
 void connectWS() {
+  lastWsAttempt = millis();
+  normalizeServerConfig();
   int port = atoi(serverPort);
-  Serial.printf("[WS] Connecting to %s:%d/ws...\n", serverIP, port);
-  ws.onMessage(onWsMessage);
-  ws.onEvent(onWsEvent);
+  bool useSSL = (port == 443);
 
-  char statusLine[32];
+  Serial.printf("[WS] Connecting (%s) to %s:%d/ws...\n", useSSL ? "wss" : "ws", serverIP, port);
+
+  ws.reset(useSSL
+    ? new WebsocketsClient(std::make_shared<InsecureSslTcpClient>())
+    : new WebsocketsClient());
+
+  ws->onMessage(onWsMessage);
+  ws->onEvent(onWsEvent);
+
+  char statusLine[80];
   snprintf(statusLine, sizeof(statusLine), "%s:%d", serverIP, port);
-  updateOled("Connecting WS...", statusLine, "Please wait...");
+  updateOled(useSSL ? "Connecting WSS..." : "Connecting WS...", statusLine, "Please wait...", "Hold BOOT 7s=Setup");
 
-  if (!ws.connect(serverIP, port, "/ws")) {
-    Serial.println(F("[WS] Failed to connect. Will retry..."));
-    updateOled("WS Connect Failed", statusLine, "Retrying in 3s...");
-    delay(3000);
+  if (!ws->connect(serverIP, port, "/ws")) {
+    Serial.println(F("[WS] Failed to connect. Will retry in 4s..."));
+    updateOled("WS Connect Failed", statusLine, "Retrying in 4s...", "Hold BOOT 7s=Setup");
   }
 }
 
 // ════════════════════════════════════════════════════════════
 //  AUDIO RECORDING & TRANSMISSION (Hold to speak)
+//  Returns false if held >= 7 seconds (WiFi Setup Reset trigger)
 // ════════════════════════════════════════════════════════════
-void recordAndSend() {
-  if (!wsConnected) {
-    blinkLED(3, 80);
-    updateOled("Cannot Speak!", "Server not connected", "Check IP/Port");
+bool recordAndSend() {
+  if (!wsConnected || !ws) {
+    return true;
+  }
+
+  Serial.println(F("[MIC] Recording started... (Release BOOT to send, hold 7s = WiFi Setup)"));
+  state = RECORDING;
+  digitalWrite(LED_PIN, HIGH);
+  updateOled("Listening...", "Speak into mic...", "Release BOOT to send", "Hold 7s = WiFi Setup");
+
+  ws->send("{\"type\":\"start_audio\"}");
+
+  // Static buffers keep loopTask stack safe alongside WiFiClientSecure TLS
+  static int32_t rawBuf[MIC_BUF_LEN * 2];
+  static int16_t pcmBuf[MIC_BUF_LEN];
+
+  // Flush initial DMA startup transient
+  size_t bytesRead = 0;
+  i2s_zero_dma_buffer(I2S_MIC_PORT);
+  i2s_read(I2S_MIC_PORT, rawBuf, sizeof(rawBuf), &bytesRead, 100 / portTICK_PERIOD_MS);
+
+  int32_t dc0 = 0, dc1 = 0;
+  bool dcInit = false;
+  int32_t sessionMaxPeak = 0;
+  int chunkCount = 0;
+  unsigned long recStart = millis();
+
+  while (digitalRead(BTN_PIN) == LOW) {
+    if (millis() - recStart >= RESET_HOLD_MS) {
+      ws->send("{\"type\":\"end_audio\"}");
+      digitalWrite(LED_PIN, aiLedState ? HIGH : LOW);
+      state = IDLE;
+      return false; // Trigger 7s WiFi Setup Portal!
+    }
+
+    bytesRead = 0;
+    i2s_read(I2S_MIC_PORT, rawBuf, sizeof(rawBuf), &bytesRead, portMAX_DELAY);
+    int frames = bytesRead / 8; // Stereo 32-bit = 8 bytes per frame
+    if (frames <= 0) continue;
+
+    // Shift >> 14 preserves 18-bit headroom and prevents DC clipping
+    if (!dcInit) {
+      int64_t sum0 = 0, sum1 = 0;
+      for (int i = 0; i < frames; i++) {
+        sum0 += (rawBuf[2 * i] >> 14);
+        sum1 += (rawBuf[2 * i + 1] >> 14);
+      }
+      dc0 = (int32_t)(sum0 / frames);
+      dc1 = (int32_t)(sum1 / frames);
+      dcInit = true;
+    }
+
+    // Pick whichever I2S slot (L or R) actually carries audio variation
+    int32_t min0 = INT32_MAX, max0 = INT32_MIN;
+    int32_t min1 = INT32_MAX, max1 = INT32_MIN;
+    for (int i = 0; i < frames; i++) {
+      int32_t s0 = rawBuf[2 * i] >> 14;
+      int32_t s1 = rawBuf[2 * i + 1] >> 14;
+      if (s0 < min0) min0 = s0;
+      if (s0 > max0) max0 = s0;
+      if (s1 < min1) min1 = s1;
+      if (s1 > max1) max1 = s1;
+    }
+    int32_t range0 = max0 - min0;
+    int32_t range1 = max1 - min1;
+    int activeSlot = (range1 > range0) ? 1 : 0;
+
+    int32_t chunkPeak = 0;
+    for (int i = 0; i < frames; i++) {
+      int32_t rawVal = rawBuf[2 * i + activeSlot] >> 14;
+      int32_t& dc = (activeSlot == 0) ? dc0 : dc1;
+      dc = (dc * 63 + rawVal) / 64;   // Remove INMP441 DC offset
+      int32_t ac = (rawVal - dc) * 4; // Clean voice gain after DC removal
+      ac = constrain(ac, -32768, 32767);
+      pcmBuf[i] = (int16_t)ac;
+      int32_t a = abs(ac);
+      if (a > chunkPeak) chunkPeak = a;
+    }
+    if (chunkPeak > sessionMaxPeak) sessionMaxPeak = chunkPeak;
+
+    chunkCount++;
+    if (chunkCount % 6 == 1) {
+      Serial.printf("[MIC] Slot=%d R0=%ld R1=%ld Peak=%ld\n",
+                    activeSlot, (long)range0, (long)range1, (long)chunkPeak);
+    }
+
+    ws->sendBinary((const char*)pcmBuf, frames * 2);
+    ws->poll();
+  }
+
+  ws->send("{\"type\":\"end_audio\"}");
+  digitalWrite(LED_PIN, aiLedState ? HIGH : LOW);
+
+  Serial.printf("[MIC] Done (%d chunks, maxPeak=%ld)\n", chunkCount, (long)sessionMaxPeak);
+  if (sessionMaxPeak < 80) {
+    state = IDLE;
+    Serial.println(F("[MIC] WARNING: Zero/silent mic signal! Check SD=32 SCK=26 WS=25 VDD=3.3V"));
+    updateOled("No Mic Signal!", "Peak=0 (Silence)", "Check D32/D26/D25", "VDD=3.3V L/R=GND");
+    return true;
+  }
+
+  state = WAITING;
+  updateOled("Thinking...", "Processing audio...", "Whisper + Groq AI");
+  return true;
+}
+
+// ════════════════════════════════════════════════════════════
+//  7-SECOND BOOT BUTTON HOLD CHECK (Works anytime!)
+// ════════════════════════════════════════════════════════════
+void checkHoldForWiFiSetup() {
+  if (digitalRead(BTN_PIN) != LOW) return;
+  delay(40); // Debounce
+  if (digitalRead(BTN_PIN) != LOW) return;
+
+  // If online & ready, record voice normally (holding >= 7s cancels & opens WiFi setup)
+  if (WiFi.status() == WL_CONNECTED && wsConnected && state == IDLE) {
+    bool normalFinish = recordAndSend();
+    if (!normalFinish) {
+      openWiFiSetupPortal();
+    }
     return;
   }
 
-  Serial.println(F("[MIC] Recording started... (Release BOOT button to finish)"));
-  state = RECORDING;
-  digitalWrite(LED_PIN, HIGH);
-  updateOled("Listening...", "Release BOOT to send", "Recording Audio...", "Mic: Active");
-
-  ws.send("{\"type\":\"start_audio\"}");
-
-  int32_t rawBuf[MIC_BUF_LEN];
-  int16_t pcmBuf[MIC_BUF_LEN];
-
+  // If offline (WiFi lost or WS failed), immediately show 7-second countdown on OLED!
+  unsigned long holdStart = millis();
+  int lastSecShown = -1;
   while (digitalRead(BTN_PIN) == LOW) {
-    size_t bytesRead = 0;
-    i2s_read(I2S_MIC_PORT, rawBuf, sizeof(rawBuf), &bytesRead, portMAX_DELAY);
-    int samples = bytesRead / 4;
-
-    // 32-bit INMP441 format -> 16-bit PCM conversion with gain
-    for (int i = 0; i < samples; i++) {
-      int32_t s = rawBuf[i] >> 11;
-      s = constrain(s, -32768, 32767);
-      pcmBuf[i] = (int16_t)s;
+    unsigned long elapsed = millis() - holdStart;
+    if (elapsed >= RESET_HOLD_MS) {
+      openWiFiSetupPortal();
+      return;
     }
-
-    ws.sendBinary((const char*)pcmBuf, samples * 2);
-    ws.poll();
+    int secLeft = (int)((RESET_HOLD_MS - elapsed + 999) / 1000);
+    if (secLeft != lastSecShown) {
+      lastSecShown = secLeft;
+      char countLine[32];
+      snprintf(countLine, sizeof(countLine), "Keep holding: %ds...", secLeft);
+      updateOled("WiFi Setup Trigger", countLine, "Creates Jarvis-Setup", "Release to cancel");
+      Serial.printf("[Setup] %s\n", countLine);
+    }
+    delay(50);
   }
 
-  ws.send("{\"type\":\"end_audio\"}");
-  digitalWrite(LED_PIN, aiLedState ? HIGH : LOW);
-  state = WAITING;
-  Serial.println(F("[MIC] Audio sent! Waiting for response..."));
-  updateOled("Thinking...", "Processing audio...", "Whisper + Groq AI");
+  // Released early before 7 seconds
+  updateOled("Setup Cancelled", "Resuming...", serverIP);
 }
 
 // ════════════════════════════════════════════════════════════
@@ -437,52 +661,35 @@ void setup() {
   setupSpeaker();
   connectWS();
 
-  Serial.println(F("[Ready] Setup complete. Hold BOOT button to talk!"));
+  Serial.println(F("[Ready] Hold BOOT to talk | Hold 7s for WiFi Setup!"));
 }
 
 void loop() {
-  // 1. Reconnect WiFi if lost
+  // 1. Always check BOOT button FIRST (works even if WiFi/WS is offline!)
+  checkHoldForWiFiSetup();
+
+  // 2. Non-blocking WiFi reconnect every 8s if dropped
   if (WiFi.status() != WL_CONNECTED) {
-    Serial.println(F("[WiFi] Disconnected! Reconnecting..."));
-    updateOled("WiFi Lost!", "Reconnecting...", "Please wait");
-    blinkLED(2, 100);
-    WiFi.reconnect();
-    delay(3000);
-    return;
-  }
-
-  // 2. Reconnect WebSocket if lost
-  if (!wsConnected) {
-    connectWS();
-    delay(2000);
-    return;
-  }
-
-  ws.poll();
-
-  // 3. Button press handling (BOOT pin = GPIO 0)
-  if (state == IDLE && digitalRead(BTN_PIN) == LOW) {
-    delay(40); // Debounce
-    if (digitalRead(BTN_PIN) == LOW) {
-      // Check if user is just tapping or holding for long reset
-      unsigned long pressStart = millis();
-      bool isReset = false;
-
-      // Start recording immediately
-      recordAndSend();
-
-      // If user kept holding for > 6 seconds, trigger WiFi reset
-      if (millis() - pressStart > 6000) {
-        Serial.println(F("[Reset] Button held > 6s! Resetting WiFi..."));
-        updateOled("Resetting WiFi...", "Clearing settings", "Restarting in AP mode");
-        blinkLED(6, 60);
-        WiFiManager wm;
-        wm.resetSettings();
-        delay(1000);
-        ESP.restart();
-      }
+    if (millis() - lastWifiAttempt >= 8000 || lastWifiAttempt == 0) {
+      lastWifiAttempt = millis();
+      Serial.println(F("[WiFi] Disconnected! Reconnecting..."));
+      updateOled("WiFi Lost!", "Reconnecting...", "Hold BOOT 7s=Setup");
+      blinkLED(2, 80);
+      WiFi.reconnect();
     }
+    delay(20);
+    return;
   }
 
+  // 3. Non-blocking WebSocket reconnect every 4s if offline
+  if (!wsConnected) {
+    if (millis() - lastWsAttempt >= 4000 || lastWsAttempt == 0) {
+      connectWS();
+    }
+    delay(20);
+    return;
+  }
+
+  if (ws) ws->poll();
   delay(10);
 }
