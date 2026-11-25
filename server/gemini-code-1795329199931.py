@@ -304,13 +304,9 @@ async def esp32_ws(ws: WebSocket):
 
                         await ws.send_text(json.dumps({"type": "audio_start", "text": reply[:40]}))
                         chunk_size = 4096
-                        burst_limit = 16384  # Send first 16KB (~512ms) upfront to fill ESP32 pre-buffer
                         for i in range(0, len(pcm_audio), chunk_size):
                             await ws.send_bytes(pcm_audio[i:i + chunk_size])
-                            if i + chunk_size < burst_limit:
-                                await asyncio.sleep(0.005)
-                            else:
-                                await asyncio.sleep(0.115)
+                            await asyncio.sleep(0.015)  # Fast streaming to keep ESP32 96KB buffer full
                         await ws.send_text(json.dumps({"type": "audio_end"}))
                     except Exception as e:
                         print("[ERROR]:", e)

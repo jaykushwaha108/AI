@@ -76,8 +76,8 @@ public:
 // ─────────────────── AUDIO CONFIG ───────────────────────────
 #define SAMPLE_RATE     16000
 #define MIC_BUF_LEN     512     // Mono samples per WS packet (32ms)
-#define AUDIO_RING_SIZE 65536   // 64 KB RAM ring buffer (~2.05s of 16kHz audio)
-#define PREBUFFER_BYTES 8192    // Buffer 8 KB (~256ms) before starting speaker
+#define AUDIO_RING_SIZE 61440   // 60 KB RAM ring buffer (~1.92s of 16kHz audio)
+#define PREBUFFER_BYTES 20480   // Buffer 20 KB (~640ms) before starting speaker
 
 // ─────────────────── CONFIG DEFAULTS ────────────────────────
 #define AP_NAME        "Jarvis-Setup"
@@ -98,16 +98,19 @@ unsigned long lastWsAttempt   = 0;
 unsigned long lastWifiAttempt = 0;
 
 enum State { IDLE, RECORDING, WAITING, PLAYING };
-State state = IDLE;
-bool aiLedState = false;
+volatile State state = IDLE;
+volatile bool aiLedState = false;
 
-// Audio Jitter / Ring Buffer Globals
+// Audio Jitter / Ring Buffer Globals (Dual-task safe)
+portMUX_TYPE ringMux = portMUX_INITIALIZER_UNLOCKED;
 static uint8_t audioRing[AUDIO_RING_SIZE];
-size_t ringHead = 0;
-size_t ringTail = 0;
-size_t ringCount = 0;
-bool playbackStarted = false;
-bool audioStreamEnded = false;
+volatile size_t ringHead = 0;
+volatile size_t ringTail = 0;
+volatile size_t ringCount = 0;
+volatile bool playbackStarted = false;
+volatile bool audioStreamEnded = false;
+volatile bool oledReadyPending = false;
+volatile uint32_t underrunCount = 0;
 
 // ════════════════════════════════════════════════════════════
 //  OLED DISPLAY HELPERS
@@ -405,66 +408,104 @@ void setupSpeaker() {
 }
 
 // ════════════════════════════════════════════════════════════
-//  AUDIO RING BUFFER HELPERS (Eliminates network stutter!)
+//  AUDIO RING BUFFER & DEDICATED FREERTOS PLAYBACK TASK
 // ════════════════════════════════════════════════════════════
 void resetAudioRing() {
+  portENTER_CRITICAL(&ringMux);
   ringHead = 0;
   ringTail = 0;
   ringCount = 0;
   playbackStarted = false;
   audioStreamEnded = false;
-}
-
-void drainRingToI2S(bool allowWait) {
-  if (state != PLAYING) return;
-  if (!playbackStarted) {
-    if (ringCount >= PREBUFFER_BYTES || (audioStreamEnded && ringCount > 0)) {
-      playbackStarted = true;
-    } else {
-      return;
-    }
-  }
-
-  while (ringCount > 0) {
-    size_t contiguous = AUDIO_RING_SIZE - ringTail;
-    size_t chunk = (ringCount < contiguous) ? ringCount : contiguous;
-    if (chunk > 2048) chunk = 2048;
-
-    size_t written = 0;
-    i2s_write(I2S_SPK_PORT, audioRing + ringTail, chunk, &written,
-              allowWait ? (20 / portTICK_PERIOD_MS) : 0);
-
-    if (written == 0) break; // DMA full right now; try next loop iteration
-    ringTail = (ringTail + written) % AUDIO_RING_SIZE;
-    ringCount -= written;
-  }
+  underrunCount = 0;
+  portEXIT_CRITICAL(&ringMux);
 }
 
 void pushAudioRing(const uint8_t* data, size_t len) {
   size_t offset = 0;
-  while (offset < len) {
+  while (offset < len && state == PLAYING) {
+    portENTER_CRITICAL(&ringMux);
     size_t freeSpace = AUDIO_RING_SIZE - ringCount;
-    if (freeSpace == 0) {
-      playbackStarted = true;
-      drainRingToI2S(true);
-      freeSpace = AUDIO_RING_SIZE - ringCount;
-      if (freeSpace == 0) {
-        delay(2);
-        continue;
-      }
-    }
-    size_t toWrite = len - offset;
-    if (toWrite > freeSpace) toWrite = freeSpace;
-    size_t firstPart = AUDIO_RING_SIZE - ringHead;
-    if (firstPart > toWrite) firstPart = toWrite;
+    if (freeSpace > 0) {
+      size_t toWrite = len - offset;
+      if (toWrite > freeSpace) toWrite = freeSpace;
+      size_t firstPart = AUDIO_RING_SIZE - ringHead;
+      if (firstPart > toWrite) firstPart = toWrite;
 
-    memcpy(audioRing + ringHead, data + offset, firstPart);
-    if (toWrite > firstPart) {
-      memcpy(audioRing, data + offset + firstPart, toWrite - firstPart);
+      memcpy(audioRing + ringHead, data + offset, firstPart);
+      if (toWrite > firstPart) {
+        memcpy(audioRing, data + offset + firstPart, toWrite - firstPart);
+      }
+      ringHead = (ringHead + toWrite) % AUDIO_RING_SIZE;
+      ringCount += toWrite;
+      offset += toWrite;
     }
-    ringHead = (ringHead + toWrite) % AUDIO_RING_SIZE;
-    ringCount += toWrite;
-    offset += toWrite;
+    portEXIT_CRITICAL(&ringMux);
+
+    if (offset < len) {
+      // Buffer temporarily full (3s ahead); wait briefly for playback task to drain
+      vTaskDelay(pdMS_TO_TICKS(5));
+    }
+  }
+}
+
+void audioPlaybackTask(void* param) {
+  static uint8_t txChunk[2048];
+  for (;;) {
+    if (state != PLAYING) {
+      vTaskDelay(pdMS_TO_TICKS(10));
+      continue;
+    }
+
+    size_t countSnap = 0;
+    bool endedSnap = false;
+    bool startedSnap = false;
+
+    portENTER_CRITICAL(&ringMux);
+    countSnap = ringCount;
+    endedSnap = audioStreamEnded;
+    if (!playbackStarted && (countSnap >= PREBUFFER_BYTES || (endedSnap && countSnap > 0))) {
+      playbackStarted = true;
+    }
+    startedSnap = playbackStarted;
+    portEXIT_CRITICAL(&ringMux);
+
+    if (!startedSnap) {
+      vTaskDelay(pdMS_TO_TICKS(5));
+      continue;
+    }
+
+    if (countSnap == 0) {
+      if (endedSnap) {
+        vTaskDelay(pdMS_TO_TICKS(280)); // Drain 256ms hardware DMA tail cleanly
+        i2s_zero_dma_buffer(I2S_SPK_PORT);
+        uint32_t drops = underrunCount;
+        resetAudioRing();
+        state = IDLE;
+        digitalWrite(LED_PIN, aiLedState ? HIGH : LOW);
+        oledReadyPending = true;
+        Serial.printf("[Audio] Playback complete. Underruns=%lu\n", (unsigned long)drops);
+      } else {
+        underrunCount++;
+        vTaskDelay(pdMS_TO_TICKS(4));
+      }
+      continue;
+    }
+
+    size_t toCopy = (countSnap > sizeof(txChunk)) ? sizeof(txChunk) : countSnap;
+    portENTER_CRITICAL(&ringMux);
+    size_t firstPart = AUDIO_RING_SIZE - ringTail;
+    if (firstPart > toCopy) firstPart = toCopy;
+    memcpy(txChunk, audioRing + ringTail, firstPart);
+    if (toCopy > firstPart) {
+      memcpy(txChunk + firstPart, audioRing, toCopy - firstPart);
+    }
+    ringTail = (ringTail + toCopy) % AUDIO_RING_SIZE;
+    ringCount -= toCopy;
+    portEXIT_CRITICAL(&ringMux);
+
+    size_t written = 0;
+    i2s_write(I2S_SPK_PORT, txChunk, toCopy, &written, portMAX_DELAY);
   }
 }
 
@@ -497,16 +538,19 @@ void onWsMessage(WebsocketsMessage msg) {
   } else if (strcmp(type, "audio_start") == 0) {
     const char* textSnippet = doc["text"] | "";
     Serial.printf("[Jarvis Speaking] %s...\n", textSnippet);
+    oledReadyPending = false;
     resetAudioRing();
-    state = PLAYING;
     i2s_zero_dma_buffer(I2S_SPK_PORT);
+    state = PLAYING;
     updateOled("Speaking...", textSnippet, "Buffering audio...", aiLedState ? "LED: ON" : "LED: OFF");
   } else if (strcmp(type, "audio_end") == 0) {
     Serial.println(F("[Audio] Stream received completely. Draining buffer..."));
+    portENTER_CRITICAL(&ringMux);
     audioStreamEnded = true;
     if (!playbackStarted && ringCount > 0) {
       playbackStarted = true;
     }
+    portEXIT_CRITICAL(&ringMux);
   } else if (strcmp(type, "iot") == 0) {
     const char* action   = doc["action"] | "";
     const char* ledstate = doc["state"]  | "off";
@@ -733,12 +777,19 @@ void setup() {
   setupWiFi();
   setupMic();
   setupSpeaker();
+  xTaskCreatePinnedToCore(audioPlaybackTask, "AudioPlay", 4096, NULL, 2, NULL, 1);
   connectWS();
 
   Serial.println(F("[Ready] Hold BOOT to talk | Hold 7s for WiFi Setup!"));
 }
 
 void loop() {
+  // Safe OLED update triggered by background AudioPlay task when speech finishes
+  if (oledReadyPending) {
+    oledReadyPending = false;
+    updateOled("Status: Ready", "Hold BOOT to talk", "Server: Connected", aiLedState ? "LED: ON" : "LED: OFF");
+  }
+
   // 1. Always check BOOT button FIRST (works even if WiFi/WS is offline!)
   checkHoldForWiFiSetup();
 
@@ -765,22 +816,5 @@ void loop() {
   }
 
   if (ws) ws->poll();
-
-  // 4. Smooth Audio Playback from 64KB Ring Buffer
-  if (state == PLAYING) {
-    drainRingToI2S(false);
-    if (audioStreamEnded && ringCount == 0) {
-      delay(280); // Wait for 256ms hardware DMA tail to finish speaking
-      i2s_zero_dma_buffer(I2S_SPK_PORT);
-      resetAudioRing();
-      state = IDLE;
-      digitalWrite(LED_PIN, aiLedState ? HIGH : LOW);
-      Serial.println(F("[Audio] Playback complete."));
-      updateOled("Status: Ready", "Hold BOOT to talk", "Server: Connected", aiLedState ? "LED: ON" : "LED: OFF");
-    }
-    delay(1);
-    return;
-  }
-
-  delay(10);
+  delay(state == PLAYING ? 1 : 10);
 }
