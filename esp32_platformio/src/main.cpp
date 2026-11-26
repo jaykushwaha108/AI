@@ -257,15 +257,42 @@ void loadServerConfig() {
   normalizeServerConfig();
 }
 
+void saveWiFiCreds(const String& ssid, const String& pass) {
+  if (ssid.length() == 0) return;
+  prefs.begin("jarvis", false);
+  prefs.putString("ssid", ssid);
+  prefs.putString("pass", pass);
+  prefs.end();
+  Serial.printf("[WiFi] Saved credentials to Flash -> SSID: %s\n", ssid.c_str());
+}
+
+void loadWiFiCreds(String& ssid, String& pass) {
+  prefs.begin("jarvis", true);
+  ssid = prefs.getString("ssid", "");
+  pass = prefs.getString("pass", "");
+  prefs.end();
+}
+
+void clearWiFiCreds() {
+  prefs.begin("jarvis", false);
+  prefs.remove("ssid");
+  prefs.remove("pass");
+  prefs.end();
+  Serial.println(F("[WiFi] Cleared saved SSID & Password from Flash."));
+}
+
 // ════════════════════════════════════════════════════════════
-//  WIFIMANAGER SETUP (Boot + On-Demand 7s Reset Portal)
+//  WIFIMANAGER SETUP (6 Boot Retries + On-Demand 7s Reset Portal)
 // ════════════════════════════════════════════════════════════
-void configureWiFiManager(WiFiManager& wm, WiFiManagerParameter& p_ip, WiFiManagerParameter& p_port) {
+void configureWiFiManager(WiFiManager& wm, WiFiManagerParameter& p_ip, WiFiManagerParameter& p_port, int portalTimeoutSec = 0) {
   wm.setTitle("Jarvis WiFi Setup");
   wm.setDarkMode(true);
   wm.setConnectTimeout(20);
   wm.setConnectRetries(3);
   wm.setCleanConnect(true);
+  if (portalTimeoutSec > 0) {
+    wm.setConfigPortalTimeout(portalTimeoutSec);
+  }
   wm.addParameter(&p_ip);
   wm.addParameter(&p_port);
 
@@ -282,40 +309,119 @@ void configureWiFiManager(WiFiManager& wm, WiFiManagerParameter& p_ip, WiFiManag
   });
 }
 
+bool tryConnectSavedWiFi(const String& ssid, const String& pass, int maxAttempts = 6) {
+  if (ssid.length() == 0) return false;
+
+  Serial.printf("[WiFi] Found saved SSID: %s (Trying up to %d times...)\n", ssid.c_str(), maxAttempts);
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  WiFi.persistent(true);
+
+  for (int attempt = 1; attempt <= maxAttempts; attempt++) {
+    char ssidLine[32], tryLine[32];
+    snprintf(ssidLine, sizeof(ssidLine), "SSID: %.20s", ssid.c_str());
+    snprintf(tryLine, sizeof(tryLine), "Try %d/%d...", attempt, maxAttempts);
+    updateOled("Connecting WiFi...", ssidLine, tryLine, "Hold BOOT 7s=Setup");
+    Serial.printf("[WiFi] Attempt %d/%d -> %s\n", attempt, maxAttempts, ssid.c_str());
+
+    WiFi.disconnect(false);
+    delay(200);
+    WiFi.begin(ssid.c_str(), pass.length() > 0 ? pass.c_str() : NULL);
+
+    // Wait up to 7 seconds per attempt (14 x 500ms)
+    for (int w = 0; w < 14; w++) {
+      if (WiFi.status() == WL_CONNECTED) {
+        return true;
+      }
+      // Allow user to force portal anytime by holding BOOT for 7s during connect retries
+      if (digitalRead(BTN_PIN) == LOW) {
+        unsigned long holdStart = millis();
+        while (digitalRead(BTN_PIN) == LOW) {
+          unsigned long elapsed = millis() - holdStart;
+          if (elapsed >= RESET_HOLD_MS) {
+            Serial.println(F("[WiFi] User forced Setup Portal during boot retries!"));
+            clearWiFiCreds();
+            return false;
+          }
+          int secLeft = (int)((RESET_HOLD_MS - elapsed + 999) / 1000);
+          char cLine[32];
+          snprintf(cLine, sizeof(cLine), "Keep holding: %ds...", secLeft);
+          updateOled("WiFi Setup Trigger", cLine, "Release to cancel");
+          delay(50);
+        }
+      }
+      delay(500);
+    }
+  }
+  Serial.println(F("[WiFi] All 6 connection attempts failed."));
+  return false;
+}
+
 void setupWiFi() {
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);
+  WiFi.persistent(true);
   loadServerConfig();
 
   WiFiManager wm;
-  WiFiManagerParameter p_ip("server_ip", "Server Host / IP", serverIP, SERVER_IP_MAX);
-  WiFiManagerParameter p_port("server_port", "Server Port", serverPort, 8);
-  configureWiFiManager(wm, p_ip, p_port);
+  String savedSsid, savedPass;
+  loadWiFiCreds(savedSsid, savedPass);
 
-  // Check if BOOT button held at power-on
+  // Fallback: migrate if WiFiManager already had NVS SSID stored
+  if (savedSsid.length() == 0) {
+    String nvsSsid = wm.getWiFiSSID(true);
+    String nvsPass = wm.getWiFiPass(true);
+    if (nvsSsid.length() > 0) {
+      savedSsid = nvsSsid;
+      savedPass = nvsPass;
+      saveWiFiCreds(savedSsid, savedPass);
+    }
+  }
+
+  // Check if BOOT button held at power-on -> force Setup Portal
   pinMode(BTN_PIN, INPUT_PULLUP);
   delay(100);
   if (digitalRead(BTN_PIN) == LOW) {
-    Serial.println(F("[WiFi] BOOT button held at boot - resetting WiFi settings..."));
+    Serial.println(F("[WiFi] BOOT button held at boot - clearing WiFi settings..."));
     updateOled("WiFi Reset!", "Clearing saved WiFi", "Starting Setup AP...");
     blinkLED(6, 60);
+    clearWiFiCreds();
     wm.resetSettings();
+    savedSsid = "";
+    savedPass = "";
   }
 
-  updateOled("Connecting WiFi...", "Connecting to router...", serverIP);
+  // Try connecting to saved WiFi 6 times BEFORE opening Setup Hotspot!
+  bool connected = tryConnectSavedWiFi(savedSsid, savedPass, 6);
 
-  if (!wm.autoConnect(AP_NAME, AP_PASS)) {
-    Serial.println(F("[WiFi] Failed to connect. Restarting..."));
-    updateOled("WiFi Failed!", "Restarting ESP32...");
-    delay(2000);
-    ESP.restart();
+  if (!connected) {
+    WiFiManagerParameter p_ip("server_ip", "Server Host / IP", serverIP, SERVER_IP_MAX);
+    WiFiManagerParameter p_port("server_port", "Server Port", serverPort, 8);
+    // If WiFi was previously saved (e.g. router temporarily off), timeout portal after 180s to retry;
+    // If fresh/reset (no SSID saved), keep portal open indefinitely until configured.
+    int portalTimeout = (savedSsid.length() > 0) ? 180 : 0;
+    configureWiFiManager(wm, p_ip, p_port, portalTimeout);
+
+    if (!wm.startConfigPortal(AP_NAME, AP_PASS)) {
+      Serial.println(F("[WiFi] Portal timed out / failed. Restarting to retry saved WiFi..."));
+      updateOled("Retrying Saved...", "Restarting ESP32...");
+      delay(1500);
+      ESP.restart();
+    }
+
+    // Save newly configured WiFi & Server config permanently to Preferences
+    String newSsid = WiFi.SSID();
+    if (newSsid.length() == 0) newSsid = wm.getWiFiSSID(true);
+    String newPass = WiFi.psk();
+    if (newPass.length() == 0) newPass = wm.getWiFiPass(true);
+    saveWiFiCreds(newSsid, newPass);
+
+    String newIP   = p_ip.getValue();
+    String newPort = p_port.getValue();
+    if (newIP.length() > 0)   newIP.toCharArray(serverIP, SERVER_IP_MAX);
+    if (newPort.length() > 0) newPort.toCharArray(serverPort, 8);
+    saveServerConfig();
   }
-
-  String newIP   = p_ip.getValue();
-  String newPort = p_port.getValue();
-  if (newIP.length() > 0)   newIP.toCharArray(serverIP, SERVER_IP_MAX);
-  if (newPort.length() > 0) newPort.toCharArray(serverPort, 8);
-  saveServerConfig();
 
   Serial.println(F("[WiFi] Connected successfully!"));
   Serial.printf ("[WiFi] ESP32 IP: %s\n", WiFi.localIP().toString().c_str());
@@ -342,10 +448,7 @@ void openWiFiSetupPortal() {
   blinkLED(5, 70);
   updateOled("WiFi Setup Mode", "Clearing old WiFi...", "Starting Hotspot...");
 
-  // Reset server config to Render default if user resets
-  strcpy(serverIP, "ai-wur3.onrender.com");
-  strcpy(serverPort, "443");
-
+  clearWiFiCreds();
   WiFiManager wm;
   wm.resetSettings();
   WiFi.disconnect(true, true);
@@ -355,10 +458,16 @@ void openWiFiSetupPortal() {
 
   WiFiManagerParameter p_ip("server_ip", "Server Host / IP", serverIP, SERVER_IP_MAX);
   WiFiManagerParameter p_port("server_port", "Server Port", serverPort, 8);
-  configureWiFiManager(wm, p_ip, p_port);
+  configureWiFiManager(wm, p_ip, p_port, 0);
 
   // Blocks until user enters new SSID/password and ESP32 connects, then auto-closes AP & portal!
   if (wm.startConfigPortal(AP_NAME, AP_PASS)) {
+    String newSsid = WiFi.SSID();
+    if (newSsid.length() == 0) newSsid = wm.getWiFiSSID(true);
+    String newPass = WiFi.psk();
+    if (newPass.length() == 0) newPass = wm.getWiFiPass(true);
+    saveWiFiCreds(newSsid, newPass);
+
     String newIP   = p_ip.getValue();
     String newPort = p_port.getValue();
     if (newIP.length() > 0)   newIP.toCharArray(serverIP, SERVER_IP_MAX);
@@ -851,7 +960,13 @@ void loop() {
       Serial.println(F("[WiFi] Disconnected! Reconnecting..."));
       updateOled("WiFi Lost!", "Reconnecting...", "Hold BOOT 7s=Setup");
       blinkLED(2, 80);
-      WiFi.reconnect();
+      String s, p;
+      loadWiFiCreds(s, p);
+      if (s.length() > 0) {
+        WiFi.begin(s.c_str(), p.length() > 0 ? p.c_str() : NULL);
+      } else {
+        WiFi.reconnect();
+      }
     }
     delay(20);
     return;
