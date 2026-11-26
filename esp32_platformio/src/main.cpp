@@ -30,7 +30,8 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <Wire.h>
-#include <WiFiManager.h>
+#include <WebServer.h>
+#include <DNSServer.h>
 #include <ArduinoWebsockets.h>
 #include <tiny_websockets/network/esp32/esp32_tcp.hpp>
 #include <ArduinoJson.h>
@@ -282,37 +283,195 @@ void clearWiFiCreds() {
 }
 
 // ════════════════════════════════════════════════════════════
-//  WIFIMANAGER SETUP (6 Boot Retries + On-Demand 7s Reset Portal)
+//  NATIVE WIFI SETUP PORTAL + 6-RETRY FLASH CREDENTIALS
 // ════════════════════════════════════════════════════════════
-void configureWiFiManager(WiFiManager& wm, WiFiManagerParameter& p_ip, WiFiManagerParameter& p_port, int portalTimeoutSec = 0) {
-  wm.setTitle("Jarvis WiFi Setup");
-  wm.setDarkMode(true);
-  wm.setConnectTimeout(20);
-  wm.setConnectRetries(3);
-  wm.setCleanConnect(true);
-  if (portalTimeoutSec > 0) {
-    wm.setConfigPortalTimeout(portalTimeoutSec);
+String htmlEscape(const String& s) {
+  String out;
+  out.reserve(s.length() + 8);
+  for (size_t i = 0; i < s.length(); i++) {
+    char c = s[i];
+    if (c == '&') out += F("&amp;");
+    else if (c == '<') out += F("&lt;");
+    else if (c == '>') out += F("&gt;");
+    else if (c == '"') out += F("&quot;");
+    else if (c == '\'') out += F("&#39;");
+    else out += c;
   }
-  wm.addParameter(&p_ip);
-  wm.addParameter(&p_port);
+  return out;
+}
 
-  wm.setAPCallback([](WiFiManager* wm) {
-    Serial.println(F("========================================"));
-    Serial.println(F("  Jarvis Setup Hotspot Active!"));
-    Serial.printf ("  SSID: %s | PASS: %s\n", AP_NAME, AP_PASS);
-    Serial.println(F("  Open browser: http://192.168.4.1"));
-    Serial.println(F("========================================"));
-    char apLine[32], passLine[32];
-    snprintf(apLine, sizeof(apLine), "WiFi: %s", AP_NAME);
-    snprintf(passLine, sizeof(passLine), "Pass: %s", AP_PASS);
-    updateOled("Setup Hotspot ON", apLine, passLine, "Open: 192.168.4.1");
+String buildSetupPage(const String& netListHtml, const String& statusBanner = "") {
+  String page;
+  page.reserve(3200);
+  page += F("<!DOCTYPE html><html><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width,initial-scale=1'>");
+  page += F("<title>Jarvis WiFi Setup</title><style>");
+  page += F("*{box-sizing:border-box;font-family:system-ui,-apple-system,sans-serif}");
+  page += F("body{background:#080808;color:#e8e8e8;margin:0;padding:18px;display:flex;justify-content:center}");
+  page += F(".card{width:100%;max-width:420px;background:#141414;border:1px solid #262626;border-radius:14px;padding:20px}");
+  page += F("h2{margin:0 0 4px;color:#D41514;letter-spacing:1.5px;font-size:20px}");
+  page += F(".sub{font-size:12px;color:#777;margin-bottom:14px}");
+  page += F(".banner{background:#1f0d0d;border:1px solid #D41514;color:#fca5a5;padding:10px;border-radius:8px;font-size:13px;margin-bottom:14px}");
+  page += F(".nets{max-height:175px;overflow-y:auto;background:#0d0d0d;border:1px solid #242424;border-radius:8px;margin-bottom:14px}");
+  page += F(".net{display:flex;justify-content:space-between;padding:10px 12px;border-bottom:1px solid #1d1d1d;cursor:pointer;font-size:13px}");
+  page += F(".net:hover{background:#1e1e1e}.net:last-child{border-bottom:none}");
+  page += F("label{display:block;font-size:11px;color:#888;text-transform:uppercase;letter-spacing:1px;margin:10px 0 5px}");
+  page += F("input{width:100%;padding:11px;background:#0d0d0d;border:1px solid #2a2a2a;color:#fff;border-radius:8px;font-size:14px;outline:none}");
+  page += F("input:focus{border-color:#D41514}");
+  page += F(".row{display:flex;gap:10px;margin-top:16px}");
+  page += F("button,a.btn{flex:1;text-align:center;text-decoration:none;padding:12px;border:none;border-radius:8px;font-size:14px;font-weight:700;cursor:pointer}");
+  page += F(".primary{background:#D41514;color:#fff}.ghost{background:#242424;color:#ccc}");
+  page += F("</style></head><body><div class='card'>");
+  page += F("<h2>JARVIS WIFI SETUP</h2><div class='sub'>Select a nearby 2.4GHz WiFi or enter details below</div>");
+  if (statusBanner.length() > 0) {
+    page += F("<div class='banner'>"); page += statusBanner; page += F("</div>");
+  }
+  page += F("<div class='nets'>"); page += netListHtml; page += F("</div>");
+  page += F("<form method='POST' action='/save'>");
+  page += F("<label>WiFi Name (SSID)</label><input id='ssid' name='ssid' required placeholder='Select above or type SSID'>");
+  page += F("<label>WiFi Password</label><input name='pass' type='password' placeholder='Enter WiFi password'>");
+  page += F("<label>Server Host / IP</label><input name='host' value='"); page += htmlEscape(String(serverIP)); page += F("'>");
+  page += F("<label>Server Port</label><input name='port' value='"); page += htmlEscape(String(serverPort)); page += F("'>");
+  page += F("<div class='row'><a class='btn ghost' href='/?scan=1'>Scan Again</a><button class='btn primary' type='submit'>Connect &amp; Save</button></div>");
+  page += F("</form></div><script>function pick(s){document.getElementById('ssid').value=s;}</script></body></html>");
+  return page;
+}
+
+String scanNetworksHtml() {
+  int n = WiFi.scanNetworks(false, false);
+  if (n <= 0) {
+    return F("<div class='net' style='color:#777'>No WiFi networks found. Tap Scan Again.</div>");
+  }
+  String html;
+  for (int i = 0; i < n && i < 15; i++) {
+    String s = WiFi.SSID(i);
+    if (s.length() == 0) continue;
+    String esc = htmlEscape(s);
+    html += F("<div class='net' onclick=\"pick('"); html += esc; html += F("')\"><span>&#128246; "); html += esc; html += F("</span><span style='color:#888'>");
+    html += String(WiFi.RSSI(i)); html += F(" dBm</span></div>");
+  }
+  WiFi.scanDelete();
+  return html;
+}
+
+bool runSetupPortal(int timeoutSec = 0) {
+  Serial.println(F("========================================"));
+  Serial.println(F("  Jarvis Setup Hotspot Active!"));
+  Serial.printf ("  SSID: %s | PASS: %s\n", AP_NAME, AP_PASS);
+  Serial.println(F("  Open browser: http://192.168.4.1"));
+  Serial.println(F("========================================"));
+
+  WiFi.disconnect(false);
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.setSleep(false);
+  WiFi.softAP(AP_NAME, AP_PASS);
+  delay(200);
+
+  char apLine[32], passLine[32];
+  snprintf(apLine, sizeof(apLine), "WiFi: %s", AP_NAME);
+  snprintf(passLine, sizeof(passLine), "Pass: %s", AP_PASS);
+  updateOled("Setup Hotspot ON", apLine, passLine, "Open: 192.168.4.1");
+
+  String cachedNets = scanNetworksHtml();
+  DNSServer dnsServer;
+  dnsServer.start(53, "*", WiFi.softAPIP());
+
+  WebServer portal(80);
+  bool portalConnected = false;
+
+  portal.on("/", HTTP_GET, [&]() {
+    if (portal.hasArg("scan") || cachedNets.length() == 0) {
+      cachedNets = scanNetworksHtml();
+    }
+    portal.send(200, "text/html", buildSetupPage(cachedNets));
   });
+
+  // Captive portal triggers for Android / iOS / Windows
+  auto sendMain = [&]() {
+    portal.send(200, "text/html", buildSetupPage(cachedNets));
+  };
+  portal.on("/generate_204", HTTP_GET, sendMain);
+  portal.on("/hotspot-detect.html", HTTP_GET, sendMain);
+  portal.on("/ncsi.txt", HTTP_GET, sendMain);
+  portal.onNotFound([&]() {
+    portal.sendHeader("Location", String("http://") + WiFi.softAPIP().toString() + "/", true);
+    portal.send(302, "text/plain", "");
+  });
+
+  portal.on("/save", HTTP_POST, [&]() {
+    String ssid = portal.arg("ssid");
+    String pass = portal.arg("pass");
+    String host = portal.arg("host");
+    String port = portal.arg("port");
+    ssid.trim();
+
+    if (ssid.length() == 0) {
+      portal.send(200, "text/html", buildSetupPage(cachedNets, "Please enter a valid WiFi name (SSID)."));
+      return;
+    }
+
+    if (host.length() > 0) host.toCharArray(serverIP, SERVER_IP_MAX);
+    if (port.length() > 0) port.toCharArray(serverPort, 8);
+    saveServerConfig();
+
+    char ssidLine[32];
+    snprintf(ssidLine, sizeof(ssidLine), "SSID: %.20s", ssid.c_str());
+    updateOled("Testing WiFi...", ssidLine, "Connecting...", "Please wait");
+    Serial.printf("[Portal] Trying to connect to SSID: %s\n", ssid.c_str());
+
+    WiFi.disconnect(false);
+    delay(200);
+    WiFi.begin(ssid.c_str(), pass.length() > 0 ? pass.c_str() : NULL);
+
+    unsigned long startMs = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - startMs < 15000) {
+      delay(250);
+    }
+
+    if (WiFi.status() == WL_CONNECTED) {
+      // Save explicitly BEFORE shutting down AP so Flash always remembers!
+      saveWiFiCreds(ssid, pass);
+
+      String okHtml = F("<!DOCTYPE html><html><body style='background:#080808;color:#22c55e;font-family:system-ui;padding:30px;text-align:center'>");
+      okHtml += F("<h2>&#9989; Connected!</h2><p style='color:#ccc'>ESP32 connected to <b>"); okHtml += htmlEscape(ssid); okHtml += F("</b></p>");
+      okHtml += F("<p style='color:#888'>IP: "); okHtml += WiFi.localIP().toString(); okHtml += F("<br>Closing Jarvis-Setup Hotspot...</p></body></html>");
+      portal.send(200, "text/html", okHtml);
+      delay(900);
+      portalConnected = true;
+    } else {
+      WiFi.disconnect(false);
+      updateOled("Wrong Password?", apLine, passLine, "Try again on phone");
+      Serial.println(F("[Portal] Connection failed. Keeping portal open."));
+      cachedNets = scanNetworksHtml();
+      portal.send(200, "text/html", buildSetupPage(cachedNets, "Failed to connect! Check password & make sure WiFi is 2.4GHz."));
+    }
+  });
+
+  portal.begin();
+  unsigned long portalStart = millis();
+
+  while (!portalConnected) {
+    dnsServer.processNextRequest();
+    portal.handleClient();
+    if (timeoutSec > 0 && (millis() - portalStart) > (unsigned long)timeoutSec * 1000UL) {
+      Serial.println(F("[Portal] Timed out waiting for user."));
+      break;
+    }
+    delay(5);
+  }
+
+  portal.stop();
+  dnsServer.stop();
+  WiFi.softAPdisconnect(true);
+  delay(200);
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  return portalConnected;
 }
 
 bool tryConnectSavedWiFi(const String& ssid, const String& pass, int maxAttempts = 6) {
   if (ssid.length() == 0) return false;
 
-  Serial.printf("[WiFi] Found saved SSID: %s (Trying up to %d times...)\n", ssid.c_str(), maxAttempts);
+  Serial.printf("[WiFi] Loaded from Flash -> SSID: %s (Trying %d times)\n", ssid.c_str(), maxAttempts);
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);
   WiFi.persistent(true);
@@ -324,16 +483,18 @@ bool tryConnectSavedWiFi(const String& ssid, const String& pass, int maxAttempts
     updateOled("Connecting WiFi...", ssidLine, tryLine, "Hold BOOT 7s=Setup");
     Serial.printf("[WiFi] Attempt %d/%d -> %s\n", attempt, maxAttempts, ssid.c_str());
 
-    WiFi.disconnect(false);
-    delay(200);
+    if (attempt > 1) {
+      WiFi.disconnect(false);
+      delay(300);
+    }
     WiFi.begin(ssid.c_str(), pass.length() > 0 ? pass.c_str() : NULL);
 
-    // Wait up to 7 seconds per attempt (14 x 500ms)
-    for (int w = 0; w < 14; w++) {
+    // Wait up to 6.5 seconds per attempt (13 x 500ms)
+    for (int w = 0; w < 13; w++) {
       if (WiFi.status() == WL_CONNECTED) {
         return true;
       }
-      // Allow user to force portal anytime by holding BOOT for 7s during connect retries
+      // Allow forcing portal anytime by holding BOOT for 7s during retries
       if (digitalRead(BTN_PIN) == LOW) {
         unsigned long holdStart = millis();
         while (digitalRead(BTN_PIN) == LOW) {
@@ -363,64 +524,37 @@ void setupWiFi() {
   WiFi.persistent(true);
   loadServerConfig();
 
-  WiFiManager wm;
   String savedSsid, savedPass;
   loadWiFiCreds(savedSsid, savedPass);
 
-  // Fallback: migrate if WiFiManager already had NVS SSID stored
-  if (savedSsid.length() == 0) {
-    String nvsSsid = wm.getWiFiSSID(true);
-    String nvsPass = wm.getWiFiPass(true);
-    if (nvsSsid.length() > 0) {
-      savedSsid = nvsSsid;
-      savedPass = nvsPass;
-      saveWiFiCreds(savedSsid, savedPass);
+  // Require continuous 1.5s hold at boot to wipe WiFi (prevents accidental boot glitches)
+  pinMode(BTN_PIN, INPUT_PULLUP);
+  if (digitalRead(BTN_PIN) == LOW) {
+    unsigned long bootHold = millis();
+    while (digitalRead(BTN_PIN) == LOW && millis() - bootHold < 1500) {
+      delay(50);
+    }
+    if (millis() - bootHold >= 1500) {
+      Serial.println(F("[WiFi] BOOT held 1.5s at power-on -> Clearing saved WiFi!"));
+      updateOled("WiFi Reset!", "Clearing saved WiFi", "Starting Setup AP...");
+      blinkLED(6, 60);
+      clearWiFiCreds();
+      savedSsid = "";
+      savedPass = "";
     }
   }
 
-  // Check if BOOT button held at power-on -> force Setup Portal
-  pinMode(BTN_PIN, INPUT_PULLUP);
-  delay(100);
-  if (digitalRead(BTN_PIN) == LOW) {
-    Serial.println(F("[WiFi] BOOT button held at boot - clearing WiFi settings..."));
-    updateOled("WiFi Reset!", "Clearing saved WiFi", "Starting Setup AP...");
-    blinkLED(6, 60);
-    clearWiFiCreds();
-    wm.resetSettings();
-    savedSsid = "";
-    savedPass = "";
-  }
-
-  // Try connecting to saved WiFi 6 times BEFORE opening Setup Hotspot!
+  // Try connecting to saved WiFi 6 times BEFORE opening Jarvis-Setup Hotspot!
   bool connected = tryConnectSavedWiFi(savedSsid, savedPass, 6);
 
   if (!connected) {
-    WiFiManagerParameter p_ip("server_ip", "Server Host / IP", serverIP, SERVER_IP_MAX);
-    WiFiManagerParameter p_port("server_port", "Server Port", serverPort, 8);
-    // If WiFi was previously saved (e.g. router temporarily off), timeout portal after 180s to retry;
-    // If fresh/reset (no SSID saved), keep portal open indefinitely until configured.
     int portalTimeout = (savedSsid.length() > 0) ? 180 : 0;
-    configureWiFiManager(wm, p_ip, p_port, portalTimeout);
-
-    if (!wm.startConfigPortal(AP_NAME, AP_PASS)) {
-      Serial.println(F("[WiFi] Portal timed out / failed. Restarting to retry saved WiFi..."));
+    if (!runSetupPortal(portalTimeout)) {
+      Serial.println(F("[WiFi] Portal timed out. Restarting to retry saved WiFi..."));
       updateOled("Retrying Saved...", "Restarting ESP32...");
-      delay(1500);
+      delay(1200);
       ESP.restart();
     }
-
-    // Save newly configured WiFi & Server config permanently to Preferences
-    String newSsid = WiFi.SSID();
-    if (newSsid.length() == 0) newSsid = wm.getWiFiSSID(true);
-    String newPass = WiFi.psk();
-    if (newPass.length() == 0) newPass = wm.getWiFiPass(true);
-    saveWiFiCreds(newSsid, newPass);
-
-    String newIP   = p_ip.getValue();
-    String newPort = p_port.getValue();
-    if (newIP.length() > 0)   newIP.toCharArray(serverIP, SERVER_IP_MAX);
-    if (newPort.length() > 0) newPort.toCharArray(serverPort, 8);
-    saveServerConfig();
   }
 
   Serial.println(F("[WiFi] Connected successfully!"));
@@ -447,42 +581,16 @@ void openWiFiSetupPortal() {
 
   blinkLED(5, 70);
   updateOled("WiFi Setup Mode", "Clearing old WiFi...", "Starting Hotspot...");
-
   clearWiFiCreds();
-  WiFiManager wm;
-  wm.resetSettings();
-  WiFi.disconnect(true, true);
-  delay(300);
-  WiFi.mode(WIFI_STA);
-  WiFi.setSleep(false);
 
-  WiFiManagerParameter p_ip("server_ip", "Server Host / IP", serverIP, SERVER_IP_MAX);
-  WiFiManagerParameter p_port("server_port", "Server Port", serverPort, 8);
-  configureWiFiManager(wm, p_ip, p_port, 0);
-
-  // Blocks until user enters new SSID/password and ESP32 connects, then auto-closes AP & portal!
-  if (wm.startConfigPortal(AP_NAME, AP_PASS)) {
-    String newSsid = WiFi.SSID();
-    if (newSsid.length() == 0) newSsid = wm.getWiFiSSID(true);
-    String newPass = WiFi.psk();
-    if (newPass.length() == 0) newPass = wm.getWiFiPass(true);
-    saveWiFiCreds(newSsid, newPass);
-
-    String newIP   = p_ip.getValue();
-    String newPort = p_port.getValue();
-    if (newIP.length() > 0)   newIP.toCharArray(serverIP, SERVER_IP_MAX);
-    if (newPort.length() > 0) newPort.toCharArray(serverPort, 8);
-    saveServerConfig();
-
+  if (runSetupPortal(0)) {
     char ipLine[32];
     snprintf(ipLine, sizeof(ipLine), "IP: %s", WiFi.localIP().toString().c_str());
     updateOled("WiFi Connected!", ipLine, "Portal Closed!", "Connecting Server...");
     Serial.println(F("[Setup] New WiFi connected & portal closed!"));
     blinkLED(3, 120);
-    lastWsAttempt = 0; // Connect immediately
+    lastWsAttempt = 0;
   } else {
-    updateOled("Setup Cancelled", "Restarting ESP32...");
-    delay(1500);
     ESP.restart();
   }
 }
